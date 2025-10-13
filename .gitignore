@@ -49,3 +49,25 @@ logs/
 # Bot specific
 config.json
 screenshots/
+
+# Environment
+.env
+.env.local
+
+# Virtual environment
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and screenshots
+logs/
+screenshots/
+*.log
+*.png
+
+# Cache
+.pytest_cache/
+.mypy_cache/
