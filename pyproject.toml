@@ -14,11 +14,15 @@ python-dotenv = "^1.1.0"
 numpy = "^2.3.0"
 matplotlib = "^3.10.0"
 aiosignal = "^1.4.0"
+pytest-cov = "^7.0.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^8.4.0"
 black = "^25.9.0"
 ruff = "^0.13.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest-asyncio = "^1.2.0"
 
 [build-system]
 requires = ["poetry-core"]

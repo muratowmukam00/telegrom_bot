@@ -1,5 +1,8 @@
 import asyncio
 import sys
+
+import pytest
+
 sys.path.insert(0, '.')
 
 # Импортируем исправленный клиент из артефакта
@@ -7,6 +10,7 @@ sys.path.insert(0, '.')
 
 from services.mexc import MexcClient
 
+@pytest.mark.asyncio
 async def test_fixed_api():
     """Тестируем исправленный API клиент"""
     

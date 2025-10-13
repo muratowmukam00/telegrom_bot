@@ -9,7 +9,7 @@ if [ -d "venv" ]; then
 fi
 
 # Запускаем тесты
-python test_bot.py
+pytest tests/ --cov=bot --cov=services --cov=config --cov-report=term-missing -v
 
 echo ""
 echo "✅ Тестирование завершено!"
