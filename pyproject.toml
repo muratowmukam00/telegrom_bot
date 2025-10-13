@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "MEXC futures signal bot with Telegram notifications"
 authors = ["muhammet"]
 readme = "README.md"
+packages = [{include = "bot"}, {include = "services"}, {include = "config"}]
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -18,7 +19,6 @@ aiosignal = "^1.4.0"
 pytest = "^8.4.0"
 black = "^25.9.0"
 ruff = "^0.13.0"
-mypy = "^1.13.0"
 
 [build-system]
 requires = ["poetry-core"]
