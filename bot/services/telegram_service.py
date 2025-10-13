@@ -9,10 +9,19 @@ class TelegramService:
     def __init__(self, bot_token: str):
         self.bot = Bot(token=bot_token)
     
-    async def send_message(self, chat_id: str, text: str) -> bool:
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str = "HTML"
+    ) -> bool:
         """Отправить текстовое сообщение"""
         try:
-            await self.bot.send_message(chat_id=chat_id, text=text)
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode
+            )
             return True
         except Exception as e:
             print(f"Error sending message: {e}")
@@ -34,7 +43,8 @@ class TelegramService:
             await self.bot.send_photo(
                 chat_id=chat_id,
                 photo=photo,
-                caption=caption
+                caption=caption,
+                parse_mode="HTML"
             )
             return True
         except Exception as e:
