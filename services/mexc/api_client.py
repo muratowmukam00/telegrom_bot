@@ -84,6 +84,7 @@ class MexcClient:
                             if data.get("data"):
                                 return float(data["data"][0].get("priceChangePercent", 0))
                             return None
+                        return None
             else:
                 async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
@@ -91,6 +92,7 @@ class MexcClient:
                         if data.get("data"):
                             return float(data["data"][0].get("priceChangePercent", 0))
                         return None
+                    return None
         except Exception as e:
             print(f"Exception in get_24h_price_change: {e}")
             return None

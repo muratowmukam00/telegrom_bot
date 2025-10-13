@@ -1,0 +1,42 @@
+[tool.poetry]
+name = "mexc-signal-bot"
+version = "0.1.0"
+description = "Telegram bot for MEXC pump/dump signal detection"
+authors = ["MuratowM"]
+# package-mode = false - УДАЛЕНО
+
+# ДОБАВЛЕНО: Эти строки сообщают Poetry, что папки 'bot' и 'services' являются
+# частью исходного кода и должны быть добавлены в PYTHONPATH.
+packages = [
+    { include = "bot" },
+    { include = "services" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+matplotlib = "^3.10.6"
+aiogram = "^3.22.0"
+python-dotenv = "^1.1.1"
+pytest = "^8.4.2"
+aiohttp-socks = "^0.10.1"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.13.3"
+black = "^25.9.0"
+isort = "^6.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+
+[tool.black]
+line-length = 88
+target-version = ['py312']
+
+[tool.isort]
+profile = "black"
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "C90"]
