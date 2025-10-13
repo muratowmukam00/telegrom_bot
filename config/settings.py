@@ -7,10 +7,8 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# MEXC API
-MEXC_API_KEY = os.getenv("MEXC_API_KEY")
-MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
-MEXC_BASE_URL = "https://contract.mexc.com"
+# MEXC API (публичный)
+MEXC_BASE_URL = os.getenv("MEXC_BASE_URL", "https://contract.mexc.com")
 
 # Bot Settings
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
