@@ -71,3 +71,97 @@ screenshots/
 # Cache
 .pytest_cache/
 .mypy_cache/
+
+# Environment
+.env
+.env.local
+
+# Virtual environment
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and screenshots
+logs/
+screenshots/
+*.log
+*.png
+
+# Cache
+.pytest_cache/
+.mypy_cache/
+
+# Environment
+.env
+.env.local
+
+# Virtual environment
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and screenshots
+logs/
+screenshots/
+*.log
+*.png
+
+# Cache
+.pytest_cache/
+.mypy_cache/
+EOFclear
+# Шаг 1: Обновляем pyproject.toml
+cat > pyproject.toml << 'EOF'
+[tool.poetry]
+name = "mexc-signal-bot"
+version = "0.1.0"
+description = "MEXC futures signal bot with Telegram notifications"
+authors = ["muhammet"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+aiogram = "^3.22.0"
+aiohttp = "^3.12.0"
+python-dotenv = "^1.1.0"
+numpy = "^2.3.0"
+matplotlib = "^3.10.0"
+aiosignal = "^1.4.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^8.4.0"
+black = "^25.9.0"
+ruff = "^0.13.0"
+mypy = "^1.13.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+# Environment
+.env
+.env.local
+
+# Virtual environment
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and screenshots
+logs/
+screenshots/
+*.log
+*.png
+
+# Cache
+.pytest_cache/
+.mypy_cache/
