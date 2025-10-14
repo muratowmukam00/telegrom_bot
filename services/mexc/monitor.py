@@ -2,312 +2,322 @@ import asyncio
 from typing import Dict, List, Tuple, Optional
 from .api_client import MexcClient
 from services.analysis import SignalAnalyzer
-from config.settings import CHECK_INTERVAL
+from config.settings import CHECK_INTERVAL, PRICE_CHANGE_THRESHOLD
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 
-class PairMonitor:
-    """
-    Мониторинг фьючерсных пар MEXC с параллельной обработкой
+class RateLimiter:
+    """Интеллектуальный ограничитель частоты запросов"""
 
-    Attributes:
-        mexc: MEXC API клиент
-        last_signal_time: Словарь последних времен сигналов для каждого символа
-        signal_cooldown: Время охлаждения между сигналами (секунды)
-        max_concurrent: Максимальное количество параллельных проверок
+    def __init__(self, requests_per_second: float = 2.0):
+        self.min_interval = 1.0 / requests_per_second
+        self.last_request_time = 0
+        self.lock = asyncio.Lock()
+        self.requests_made = 0
+
+    async def wait(self):
+        """Подождать перед следующим запросом"""
+        async with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_request_time
+
+            if time_since_last < self.min_interval:
+                wait_time = self.min_interval - time_since_last
+                await asyncio.sleep(wait_time)
+
+            self.last_request_time = time.time()
+            self.requests_made += 1
+
+
+class OptimizedPairMonitor:
+    """
+    Оптимизированный мониторинг с ранней фильтрацией
+
+    Логика:
+    1. Проверяем ±8% изменение за 15 мин (1 запрос на 5m свечи)
+    2. Если НЕ прошло → СТОП, переходим к следующей паре
+    3. Если ДА → продолжаем проверку RSI (остальные 3-4 запроса)
+
+    Экономия: ~75% запросов на парах без сигналов
     """
 
     def __init__(
             self,
             signal_cooldown: int = 300,
-            max_concurrent: int = 10
+            max_concurrent: int = 5,
+            requests_per_second: float = 2.0
     ):
-        """
-        Args:
-            signal_cooldown: Время между повторными сигналами для одного символа (сек)
-            max_concurrent: Максимум параллельных проверок (чтобы не перегрузить API)
-        """
         self.mexc = MexcClient()
         self.last_signal_time: Dict[str, float] = {}
         self.signal_cooldown = signal_cooldown
         self.max_concurrent = max_concurrent
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.rate_limiter = RateLimiter(requests_per_second)
 
-    async def get_prices_for_symbol(
+        # Статистика
+        self.total_requests = 0
+        self.failed_requests = 0
+        self.rate_limit_hits = 0
+        self.signals_triggered = 0
+        self.early_filtered_count = 0  # Пары, отфильтрованные на шаге 1
+
+    async def _make_api_request(
+            self,
+            coro,
+            symbol: str,
+            interval: str
+    ) -> Optional[List]:
+        """Выполнить API запрос с rate limiting"""
+        try:
+            await self.rate_limiter.wait()
+            self.total_requests += 1
+
+            result = await coro
+            return result
+        except Exception as e:
+            self.failed_requests += 1
+            logger.debug(f"API ошибка для {symbol} ({interval}): {e}")
+            return None
+
+    async def check_price_filter_only(
             self,
             client: MexcClient,
-            symbol: str,
-            interval: str,
-            limit: int
-    ) -> List[float]:
+            symbol: str
+    ) -> Tuple[bool, List[float]]:
         """
-        Получить список цен закрытия для символа
-
-        Args:
-            client: Уже открытый MEXC клиент
-            symbol: Торговая пара
-            interval: Интервал (1m, 5m, 15m, 1h)
-            limit: Количество свечей
+        Шаг 1: Проверить ТОЛЬКО фильтр цены (±8% за 15 мин)
 
         Returns:
-            Список цен закрытия
+            (passed, prices_5m) - True если прошел фильтр, иначе False
         """
         try:
-            klines = await client.get_klines(symbol, interval, limit)
+            # ТОЛЬКО ОДИН запрос - получаем 5m свечи
+            klines_5m = await self._make_api_request(
+                self.mexc.get_klines(symbol, "5m", 144),
+                symbol,
+                "5m"
+            )
 
-            if not klines:
-                return []
+            if not klines_5m or len(klines_5m) < 15:
+                return False, []
 
-            # Извлекаем цены закрытия
-            prices = client.extract_close_prices(klines)
-            return prices
+            # Извлекаем цены
+            prices_5m = self.mexc.extract_close_prices(klines_5m)
+
+            if len(prices_5m) < 15:
+                return False, []
+
+            # Проверяем только фильтр цены (используем последние 15 свечей = 75 минут)
+            # На самом деле нам нужны последние 3 свечи (15 минут)
+            prices_15min = prices_5m[-3:]
+
+            if len(prices_15min) >= 3:
+                old_price = prices_15min[0]
+                new_price = prices_15min[-1]
+
+                if old_price > 0:
+                    price_change = abs((new_price - old_price) / old_price * 100)
+
+                    # ЕСЛИ не прошел фильтр цены - СТОП
+                    if price_change < PRICE_CHANGE_THRESHOLD:
+                        self.early_filtered_count += 1
+                        return False, []
+
+                    logger.debug(f"✓ {symbol}: цена изменилась на {price_change:.2f}% (прошел фильтр 1)")
+                    return True, prices_5m
+
+            return False, []
 
         except Exception as e:
-            logger.error(f"Error getting prices for {symbol} ({interval}): {e}")
-            return []
+            logger.error(f"Ошибка проверки цены для {symbol}: {e}")
+            return False, []
 
-    async def get_volumes_for_symbol(
+    async def check_rsi_filters(
             self,
             client: MexcClient,
-            symbol: str,
-            interval: str,
-            limit: int
-    ) -> List[float]:
+            symbol: str
+    ) -> Tuple[bool, float, float]:
         """
-        Получить список объёмов для символа
-
-        Args:
-            client: Уже открытый MEXC клиент
-            symbol: Торговая пара
-            interval: Интервал (1m, 5m, 15m, 1h)
-            limit: Количество свечей
+        Шаг 2: Проверить RSI фильтры (вызывается ТОЛЬКО если прошел фильтр цены)
 
         Returns:
-            Список объёмов
+            (rsi_passed, rsi_1h, rsi_15m)
         """
         try:
-            klines = await client.get_klines(symbol, interval, limit)
+            # Получаем RSI 1h
+            prices_1h = await self._make_api_request(
+                self.mexc.get_klines(symbol, "1h", 100),
+                symbol,
+                "1h"
+            )
+            if not prices_1h or len(prices_1h) < 30:
+                return False, 0.0, 0.0
 
-            if not klines:
-                return []
+            prices_1h_list = self.mexc.extract_close_prices(prices_1h)
 
-            # Извлекаем объёмы
-            volumes = client.extract_volumes(klines)
-            return volumes
+            # Получаем RSI 15m
+            prices_15m = await self._make_api_request(
+                self.mexc.get_klines(symbol, "15m", 100),
+                symbol,
+                "15m"
+            )
+            if not prices_15m or len(prices_15m) < 30:
+                return False, 0.0, 0.0
+
+            prices_15m_list = self.mexc.extract_close_prices(prices_15m)
+
+            # Анализируем RSI
+            from services.analysis import RSICalculator
+            from config.settings import RSI_PERIOD, RSI_OVERBOUGHT, RSI_OVERSOLD
+
+            rsi_1h = RSICalculator.get_last_rsi(prices_1h_list, RSI_PERIOD)
+            rsi_15m = RSICalculator.get_last_rsi(prices_15m_list, RSI_PERIOD)
+
+            # Проверяем оба RSI
+            rsi_1h_passed = rsi_1h > RSI_OVERBOUGHT or rsi_1h < RSI_OVERSOLD
+            rsi_15m_passed = rsi_15m > RSI_OVERBOUGHT or rsi_15m < RSI_OVERSOLD
+
+            rsi_passed = rsi_1h_passed and rsi_15m_passed
+
+            if rsi_passed:
+                logger.debug(f"✓ {symbol}: RSI прошли (1h={rsi_1h:.1f}, 15m={rsi_15m:.1f})")
+            else:
+                logger.debug(f"✗ {symbol}: RSI не прошли (1h={rsi_1h:.1f}, 15m={rsi_15m:.1f})")
+
+            return rsi_passed, rsi_1h, rsi_15m
 
         except Exception as e:
-            logger.error(f"Error getting volumes for {symbol} ({interval}): {e}")
-            return []
+            logger.error(f"Ошибка проверки RSI для {symbol}: {e}")
+            return False, 0.0, 0.0
 
-    async def check_symbol_with_semaphore(
+    async def check_symbol_async(
             self,
             symbol: str,
             client: MexcClient
     ) -> Tuple[bool, Dict]:
         """
-        Проверить символ с ограничением параллельности
+        ПОЛНАЯ ПРОВЕРКА с ранней фильтрацией
 
-        Args:
-            symbol: Торговая пара
-            client: MEXC клиент
-
-        Returns:
-            Tuple[signal_found, signal_data]
+        Логика:
+        1. Шаг 1: Проверить ±8% (1 запрос)
+           - Если НЕ прошел → return False (экономия 3-4 запросов!)
+        2. Шаг 2: Проверить RSI 1h и 15m (2 запроса)
+        3. Шаг 3: Получить полные данные для график (1 запрос на объём)
         """
         async with self.semaphore:
-            return await self._check_symbol_with_client(symbol, client)
+            try:
+                logger.debug(f"Проверка {symbol} - Шаг 1 (фильтр цены)...")
 
-    async def check_symbol(self, symbol: str, client: Optional[MexcClient] = None) -> Tuple[bool, Dict]:
-        """
-        Проверить символ на предмет торговых сигналов
+                # ШАГ 1: Проверить фильтр цены (1 запрос на 5m)
+                price_passed, prices_5m = await self.check_price_filter_only(client, symbol)
 
-        Args:
-            symbol: Торговая пара для проверки
-            client: Опциональный уже открытый клиент (для оптимизации)
+                if not price_passed:
+                    # Не прошел фильтр цены - СТОП, не делаем остальные запросы
+                    logger.debug(f"✗ {symbol}: цена не прошла фильтр, пропускаем")
+                    return False, {}
 
-        Returns:
-            Tuple[signal_found, signal_data]
-            - signal_found: Найден ли сигнал
-            - signal_data: Данные сигнала (символ, анализ, цены, объёмы)
-        """
-        try:
-            logger.debug(f"Checking {symbol}...")
+                # ШАГ 2: Проверить RSI фильтры (2 запроса на 1h и 15m)
+                logger.debug(f"Проверка {symbol} - Шаг 2 (фильтры RSI)...")
+                rsi_passed, rsi_1h, rsi_15m = await self.check_rsi_filters(client, symbol)
 
-            # Если клиент не передан, создаём временный
-            if client is None:
-                async with self.mexc as temp_client:
-                    return await self._check_symbol_with_client(symbol, temp_client)
-            else:
-                return await self._check_symbol_with_client(symbol, client)
+                if not rsi_passed:
+                    logger.debug(f"✗ {symbol}: RSI не прошли")
+                    return False, {}
 
-        except Exception as e:
-            logger.error(f"Error checking symbol {symbol}: {e}", exc_info=True)
-            return False, {}
-
-    async def _check_symbol_with_client(self, symbol: str, client: MexcClient) -> Tuple[bool, Dict]:
-        """Внутренний метод проверки с готовым клиентом"""
-        # Получаем данные параллельно для ускорения
-        results = await asyncio.gather(
-            self.get_prices_for_symbol(client, symbol, "1m", 200),
-            self.get_prices_for_symbol(client, symbol, "5m", 144),  # 12 часов
-            self.get_prices_for_symbol(client, symbol, "15m", 100),
-            self.get_prices_for_symbol(client, symbol, "1h", 100),
-            self.get_volumes_for_symbol(client, symbol, "5m", 144),
-            return_exceptions=True
-        )
-
-        # Распаковываем результаты
-        prices_1m, prices_5m, prices_15m, prices_1h, volumes_5m = results
-
-        # Проверяем на ошибки
-        if any(isinstance(r, Exception) for r in results):
-            logger.error(f"Error in gathering data for {symbol}")
-            return False, {}
-
-        # Проверяем что все данные получены
-        if not all([prices_1m, prices_5m, prices_15m, prices_1h, volumes_5m]):
-            logger.debug(f"Incomplete data for {symbol}")
-            return False, {}
-
-        # Анализируем сигнал
-        analysis = SignalAnalyzer.analyze_signal(
-            prices_1m[:15],  # Последние 15 минут (15 свечей по 1м)
-            prices_15m,
-            prices_1h
-        )
-
-        signal_triggered = analysis['signal_triggered']
-
-        if signal_triggered:
-            logger.info(f"🔔 Signal detected for {symbol}!")
-
-        return signal_triggered, {
-            'symbol': symbol,
-            'analysis': analysis,
-            'prices_5m': prices_5m,
-            'volumes_5m': volumes_5m
-        }
-
-    def _check_cooldown(self, symbol: str) -> bool:
-        """
-        Проверить прошло ли достаточно времени с последнего сигнала
-
-        Args:
-            symbol: Торговая пара
-
-        Returns:
-            True если можно отправить сигнал, False если cooldown активен
-        """
-        import time
-        current_time = time.time()
-        last_time = self.last_signal_time.get(symbol, 0)
-
-        if current_time - last_time >= self.signal_cooldown:
-            return True
-
-        remaining = int(self.signal_cooldown - (current_time - last_time))
-        logger.debug(f"Cooldown active for {symbol}: {remaining}s remaining")
-        return False
-
-    def _update_signal_time(self, symbol: str):
-        """Обновить время последнего сигнала для символа"""
-        import time
-        self.last_signal_time[symbol] = time.time()
-
-    async def monitor_all_pairs(self) -> List[Dict]:
-        """
-        Мониторить все USDT пары и найти сигналы (ПАРАЛЛЕЛЬНО)
-
-        Returns:
-            Список найденных сигналов с данными
-        """
-        try:
-            # Используем один клиент для всех запросов
-            async with self.mexc as client:
-                # Получаем список всех символов
-                symbols = await client.get_all_symbols()
-
-                if not symbols:
-                    logger.warning("No symbols found")
-                    return []
-
-                logger.info(f"🔍 Monitoring {len(symbols)} symbols in parallel...")
-                start_time = asyncio.get_event_loop().time()
-
-                # 🚀 ПАРАЛЛЕЛЬНАЯ ПРОВЕРКА ВСЕХ СИМВОЛОВ
-                tasks = [
-                    self.check_symbol_with_semaphore(symbol, client)
-                    for symbol in symbols
-                ]
-
-                # Ждем завершения всех проверок
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Обрабатываем результаты
-                signals = []
-                errors = 0
-
-                for symbol, result in zip(symbols, results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Error checking {symbol}: {result}")
-                        errors += 1
-                        continue
-
-                    signal_found, data = result
-
-                    if signal_found:
-                        # Проверяем cooldown
-                        if self._check_cooldown(symbol):
-                            signals.append(data)
-                            self._update_signal_time(symbol)
-                            logger.info(f"✅ Signal added: {symbol}")
-                        else:
-                            logger.debug(f"Signal ignored (cooldown): {symbol}")
-
-                elapsed = asyncio.get_event_loop().time() - start_time
-
-                logger.info(
-                    f"✅ Scan completed in {elapsed:.2f}s | "
-                    f"Signals: {len(signals)} | Errors: {errors}"
+                # ШАГ 3: Получить последние 15 цен для 1m (для полной проверки)
+                logger.debug(f"Проверка {symbol} - Шаг 3 (финальная проверка)...")
+                prices_1m = await self._make_api_request(
+                    self.mexc.get_klines(symbol, "1m", 200),
+                    symbol,
+                    "1m"
                 )
 
-                return signals
+                if not prices_1m or len(prices_1m) < 15:
+                    prices_1m = []
+                else:
+                    prices_1m = self.mexc.extract_close_prices(prices_1m)
 
-        except Exception as e:
-            logger.error(f"Error monitoring pairs: {e}", exc_info=True)
-            return []
+                # ШАГ 4: Получить объёмы для графика
+                volumes_5m = []
+                try:
+                    await self.rate_limiter.wait()
+                    self.total_requests += 1
+                    klines_5m = await client.get_klines(symbol, "5m", 144)
+                    if klines_5m:
+                        volumes_5m = client.extract_volumes(klines_5m)
+                except:
+                    volumes_5m = [0] * len(prices_5m)
+
+                # Финальная проверка всех фильтров
+                analysis = SignalAnalyzer.analyze_signal(
+                    prices_1m[:15] if prices_1m else [],
+                    prices_5m,
+                    prices_5m  # Используем 5m вместо 1h для быстрой проверки
+                )
+
+                signal_triggered = analysis['signal_triggered']
+
+                if signal_triggered:
+                    logger.info(f"✓ СИГНАЛ НАЙДЕН: {symbol}!")
+                    self.signals_triggered += 1
+
+                return signal_triggered, {
+                    'symbol': symbol,
+                    'analysis': analysis,
+                    'prices_5m': prices_5m,
+                    'volumes_5m': volumes_5m
+                }
+
+            except Exception as e:
+                self.failed_requests += 1
+                logger.error(f"Ошибка при проверке {symbol}: {e}")
+                return False, {}
+
+    def _check_cooldown(self, symbol: str) -> bool:
+        """Проверить cooldown для символа"""
+        current_time = time.time()
+        last_time = self.last_signal_time.get(symbol, 0)
+        return current_time - last_time >= self.signal_cooldown
+
+    def _update_signal_time(self, symbol: str):
+        """Обновить время последнего сигнала"""
+        self.last_signal_time[symbol] = time.time()
 
     async def monitor_specific_symbols(self, symbols: List[str]) -> List[Dict]:
         """
-        Мониторить только определённые символы (ПАРАЛЛЕЛЬНО)
+        Мониторить символы с РАННЕЙ ФИЛЬТРАЦИЕЙ
 
-        Args:
-            symbols: Список символов для мониторинга
-
-        Returns:
-            Список найденных сигналов
+        Экономия запросов:
+        - На каждую пару БЕЗ сигнала: экономия 3-4 запроса
+        - На каждую пару С сигналом: +5 запросов вместо +1
+        - Если 400 пар, из них только 1-2 с сигналом:
+          * Без оптимизации: 400 * 5 = 2000 запросов
+          * С оптимизацией: 1 + (399 * 1) + (2 * 4) = ~408 запросов (!)
+          * ЭКОНОМИЯ: 80-90%!
         """
-        logger.info(f"🔍 Monitoring {len(symbols)} specific symbols in parallel...")
-        start_time = asyncio.get_event_loop().time()
+        logger.info(f"🔍 Мониторинг {len(symbols)} пар (оптимизированный режим)...")
+        start_time = time.time()
 
         signals = []
+        tasks = []
 
-        # Используем один клиент для всех запросов
         async with self.mexc as client:
-            # Параллельная проверка
-            tasks = [
-                self.check_symbol_with_semaphore(symbol, client)
-                for symbol in symbols
-            ]
+            # Создаём задачи для всех символов
+            for symbol in symbols:
+                task = self.check_symbol_async(symbol, client)
+                tasks.append(task)
 
+            # Выполняем параллельно
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Обрабатываем результаты
             for symbol, result in zip(symbols, results):
                 if isinstance(result, Exception):
-                    logger.error(f"Error checking {symbol}: {result}")
+                    logger.error(f"Исключение для {symbol}: {result}")
+                    self.failed_requests += 1
                     continue
 
                 signal_found, data = result
@@ -315,54 +325,41 @@ class PairMonitor:
                 if signal_found and self._check_cooldown(symbol):
                     signals.append(data)
                     self._update_signal_time(symbol)
-                    logger.info(f"✅ Signal found: {symbol}")
+                    logger.info(f"✅ Сигнал добавлен: {symbol}")
 
-        elapsed = asyncio.get_event_loop().time() - start_time
-        logger.info(f"✅ Specific symbols scan completed in {elapsed:.2f}s | Signals: {len(signals)}")
+        elapsed = time.time() - start_time
+
+        success_rate = (
+            (self.total_requests - self.failed_requests) / self.total_requests * 100
+            if self.total_requests > 0 else 0
+        )
+
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"✅ Сканирование завершено за {elapsed:.2f}s")
+        logger.info(f"{'=' * 70}")
+        logger.info(f"📊 Проверено пар: {len(symbols)}")
+        logger.info(f"🚀 Отфильтровано на шаге 1 (цена): {self.early_filtered_count}")
+        logger.info(f"🎯 Найдено сигналов: {len(signals)}")
+        logger.info(f"📡 API запросов: {self.total_requests}")
+        logger.info(f"❌ Ошибок: {self.failed_requests}")
+        logger.info(f"✅ Процент успеха: {success_rate:.1f}%")
+        logger.info(f"💾 Экономия запросов: ~{(self.early_filtered_count * 3 / self.total_requests * 100):.1f}%")
+        logger.info(f"{'=' * 70}\n")
 
         return signals
 
     async def get_statistics(self) -> Dict:
-        """
-        Получить статистику по сигналам
+        """Получить статистику"""
+        success_rate = (
+            (self.total_requests - self.failed_requests) / self.total_requests * 100
+            if self.total_requests > 0 else 0
+        )
 
-        Returns:
-            Словарь со статистикой
-        """
         return {
-            'total_symbols_tracked': len(self.last_signal_time),
-            'symbols_on_cooldown': sum(
-                1 for symbol in self.last_signal_time.keys()
-                if not self._check_cooldown(symbol)
-            ),
-            'cooldown_seconds': self.signal_cooldown,
-            'max_concurrent_checks': self.max_concurrent
+            'total_requests': self.total_requests,
+            'failed_requests': self.failed_requests,
+            'early_filtered': self.early_filtered_count,
+            'signals_triggered': self.signals_triggered,
+            'success_rate': f"{success_rate:.1f}%",
+            'rate_limit_hits': self.rate_limit_hits
         }
-
-
-# Пример использования
-async def example_usage():
-    """Пример использования оптимизированного монитора"""
-
-    # Создаем монитор с 15 параллельными проверками
-    monitor = PairMonitor(
-        signal_cooldown=300,  # 5 минут
-        max_concurrent=15  # До 15 пар одновременно
-    )
-
-    # Вариант 1: Мониторить все пары (БЫСТРО!)
-    signals = await monitor.monitor_all_pairs()
-    print(f"Found {len(signals)} signals")
-
-    # Вариант 2: Мониторить только топ пары
-    top_symbols = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "BNB_USDT", "XRP_USDT"]
-    signals = await monitor.monitor_specific_symbols(top_symbols)
-    print(f"Found {len(signals)} signals in top pairs")
-
-    # Получить статистику
-    stats = await monitor.get_statistics()
-    print(f"Stats: {stats}")
-
-
-if __name__ == "__main__":
-    asyncio.run(example_usage())
