@@ -46,9 +46,9 @@ class OptimizedPairMonitor:
 
     def __init__(
             self,
-            signal_cooldown: int = 300,
-            max_concurrent: int = 5,
-            requests_per_second: float = 2.0
+            signal_cooldown: int = 60,
+            max_concurrent: int = 20,
+            requests_per_second: float = 15
     ):
         self.mexc = MexcClient()
         self.last_signal_time: Dict[str, float] = {}
