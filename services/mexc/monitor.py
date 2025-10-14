@@ -3,6 +3,8 @@ from typing import Dict, List, Tuple, Optional
 from .api_client import MexcClient
 from services.analysis import SignalAnalyzer
 from config.settings import CHECK_INTERVAL, PRICE_CHANGE_THRESHOLD
+from services.mexc.ws_client import MexcWSClient
+
 import logging
 import time
 
@@ -81,6 +83,16 @@ class OptimizedPairMonitor:
             self.failed_requests += 1
             logger.debug(f"API ошибка для {symbol} ({interval}): {e}")
             return None
+
+    async def start_websocket_monitor(self, symbols):
+        async def handle_message(data):
+            symbol = data["s"]
+            price = float(data["c"])
+            # RSI ýa-da başga filtrleme logikaňy şu ýerde ulanyp bolýar
+            logger.info(f"{symbol}: {price}")
+
+        ws_client = MexcWSClient(symbols, on_message=handle_message)
+        await ws_client.connect_all()
 
     async def check_price_filter_only(
             self,

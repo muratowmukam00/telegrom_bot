@@ -182,10 +182,10 @@ class MexcSignalBot:
                     await asyncio.sleep(60)
                     continue
 
-                logger.info(f"📊 Мониторинг {len(symbols_to_check)} пар с MEXC")
+                logger.info(f"📊 Мониторинг {len(symbols_to_check)} пар с MEXC (через WebSocket)")
 
                 # Мониторим все пары
-                signals = await self.monitor.monitor_specific_symbols(symbols_to_check)
+                signals = await self.monitor.start_websocket_monitor(symbols_to_check)
 
                 # Обрабатываем найденные сигналы
                 for signal in signals:
