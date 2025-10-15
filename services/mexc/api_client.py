@@ -305,12 +305,9 @@ class MexcClient:
 
     async def get_all_symbols(self) -> List[str]:
         """
-        Получить список всех USDT фьючерсных пар
-
-        Returns:
-            Список символов (например, ['BTC_USDT', 'ETH_USDT', ...])
+        Получить список всех USDT фьючерсных пар (корректно)
         """
-        url = f"{self.base_url}/api/v1/contract/detail"
+        url = f"{self.base_url}/api/v1/contract/pair/list"
 
         try:
             data = await self._make_request(url)
@@ -320,23 +317,22 @@ class MexcClient:
                 return []
 
             contracts = data["data"]
-
             if not isinstance(contracts, list):
                 logger.error("Invalid contracts format")
                 return []
 
-            # Фильтруем только USDT пары
+            # Фильтруем только USDT фьючерсные пары
             symbols = [
-                contract["symbol"]
-                for contract in contracts
-                if isinstance(contract, dict) and "USDT" in contract.get("symbol", "")
+                c["symbol"]
+                for c in contracts
+                if isinstance(c, dict) and c.get("quoteCurrency") == "USDT"
             ]
 
-            logger.info(f"Found {len(symbols)} USDT pairs")
+            logger.info(f"Found {len(symbols)} USDT futures pairs ✅")
             return symbols
 
         except Exception as e:
-            logger.error(f"Error getting symbols: {e}")
+            logger.error(f"Error getting futures pairs: {e}", exc_info=True)
             return []
 
     async def get_24h_price_change(self, symbol: str) -> Optional[float]:

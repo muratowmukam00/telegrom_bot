@@ -1,25 +1,57 @@
 import asyncio
 import logging
+import signal
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
+
 from config.settings import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL, LOG_LEVEL
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL, LOG_LEVEL,
+    LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT, validate_settings, HEALTH_CHECK_INTERVAL
 )
 from bot.services import TelegramService
 from bot.utils import ChartGenerator
 from bot.handlers import commands
-from services.mexc import OptimizedPairMonitor, MexcClient
+from services.mexc import OptimizedPairMonitor, MexcClient, MexcWSClient
 
-# Настройка логирования
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+
+# ===== НАСТРОЙКА ЛОГИРОВАНИЯ =====
+def setup_logging():
+    """Настроить логирование с rotation"""
+    log_dir = LOG_FILE.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, LOG_LEVEL))
+
+    # File handler с rotation
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT
+    )
+    file_handler.setLevel(getattr(logging, LOG_LEVEL))
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, LOG_LEVEL))
+
+    # Formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+logger = setup_logging()
 
 
 class CachedPairManager:
@@ -63,7 +95,6 @@ class CachedPairManager:
 
     async def get_pairs(self) -> list:
         """Получить список пар (из кэша или обновить)"""
-
         # Если кэш существует и не истёк, используем его
         if not self._is_cache_expired() and self.cached_pairs:
             logger.debug(f"✅ Используется кэшированный список ({len(self.cached_pairs)} пар)")
@@ -95,25 +126,26 @@ class CachedPairManager:
 
         except Exception as e:
             logger.error(f"❌ Ошибка получения пар: {e}")
-            # Fallback на кэш из файла
             self.cached_pairs = self._load_from_file()
             return self.cached_pairs
 
 
 class MexcSignalBot:
-    """Основной класс бота с оптимизацией"""
+    """Основной класс бота с улучшениями"""
 
     def __init__(self, bot_token: str, chat_id: str):
         self.telegram = TelegramService(bot_token)
         self.chat_id = chat_id
         self.monitor = OptimizedPairMonitor(
-            signal_cooldown=300,  # 5 минут между повторными сигналами
-            max_concurrent=5,  # Увеличено до 5 параллельных проверок
-            requests_per_second=2  # 2 запроса в секунду
+            signal_cooldown=300,
+            max_concurrent=5,
+            requests_per_second=2
         )
         self.is_running = False
         self.signals_found = 0
         self.pair_manager = CachedPairManager(cache_duration_hours=24)
+        self.last_health_check = datetime.now()
+        self.cycle_count = 0
 
         Path("logs/signals").mkdir(parents=True, exist_ok=True)
 
@@ -150,6 +182,7 @@ class MexcSignalBot:
                     chart_path,
                     caption=f"📊 График {symbol} (5m, последние 12ч)"
                 )
+                logger.info(f"✅ График отправлен для {symbol}")
 
             self.signals_found += 1
             return True
@@ -158,64 +191,91 @@ class MexcSignalBot:
             logger.error(f"Ошибка обработки сигнала: {e}", exc_info=True)
             return False
 
+    async def health_check(self):
+        """Периодическая проверка здоровья бота"""
+        try:
+            stats = await self.monitor.get_statistics()
+
+            message = (
+                f"🏥 <b>Health Check</b>\n\n"
+                f"📊 Всего сигналов: {self.signals_found}\n"
+                f"📡 API запросов: {stats['total_requests']}\n"
+                f"❌ Ошибок: {stats['failed_requests']}\n"
+                f"✅ Успешность: {stats['success_rate']}\n"
+                f"⏱️ Время работы: {stats['uptime']}\n"
+                f"🔄 Циклов: {self.cycle_count}"
+            )
+
+            await self.telegram.send_message(self.chat_id, message)
+            logger.info("✅ Health check отправлен")
+
+        except Exception as e:
+            logger.error(f"Ошибка health check: {e}")
+
     async def monitoring_loop(self):
-        """Главный цикл мониторинга всех пар"""
-        logger.info("🚀 Запуск цикла мониторинга...")
+        """Главный цикл мониторинга через WebSocket (все USDT пары)"""
+        logger.info("🚀 Запуск цикла мониторинга через WebSocket...")
         self.is_running = True
 
-        cycle_num = 0
+        # === Загружаем все пары USDT ===
+        symbols_to_check = await self.pair_manager.get_pairs()
+        symbols_to_check = [s for s in symbols_to_check if "USDT" in s]
+        logger.info(f"📂 Подготовлено {len(symbols_to_check)} USDT пар для мониторинга через WS")
 
-        while self.is_running:
+        # === Хранилище цен ===
+        price_cache = {}
+        last_prices = {}
+
+        async def handle_message(data):
+            """Обновление цены от WebSocket"""
             try:
-                cycle_num += 1
-                start_time = datetime.now()
-
-                logger.info(f"\n{'=' * 60}")
-                logger.info(f"🔄 ЦИКЛ #{cycle_num} | {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                logger.info(f"{'=' * 60}")
-
-                # Получаем список пар (из кэша если возможно)
-                symbols_to_check = await self.pair_manager.get_pairs()
-
-                if not symbols_to_check:
-                    logger.error("❌ Не удалось получить список пар!")
-                    await asyncio.sleep(60)
-                    continue
-
-                logger.info(f"📊 Мониторинг {len(symbols_to_check)} пар с MEXC (через WebSocket)")
-
-                # Мониторим все пары
-                signals = await self.monitor.start_websocket_monitor(symbols_to_check)
-
-                # Обрабатываем найденные сигналы
-                for signal in signals:
-                    await self.process_signal(signal)
-
-                # Статистика цикла
-                elapsed = (datetime.now() - start_time).total_seconds()
-                stats = await self.monitor.get_statistics()
-
-                logger.info(f"\n{'=' * 60}")
-                logger.info(f"📊 ЦИКЛ #{cycle_num} ЗАВЕРШЁН")
-                logger.info(f"{'=' * 60}")
-                logger.info(f"⏱️  Время выполнения: {elapsed:.1f}s")
-                logger.info(f"🎯 Найдено сигналов: {len(signals)} (всего: {self.signals_found})")
-                logger.info(f"📡 API запросов: {stats['total_requests']}")
-                logger.info(f"✅ Процент успеха: {stats['success_rate']}")
-                logger.info(f"⚠️  Rate limits: {stats['rate_limit_hits']}")
-                logger.info(f"{'=' * 60}\n")
-
-                # Ждём перед следующей проверкой
-                wait_time = max(CHECK_INTERVAL - elapsed, 10)
-                logger.info(f"💤 Ожидание {wait_time:.0f}s перед следующим циклом...")
-                await asyncio.sleep(wait_time)
-
-            except KeyboardInterrupt:
-                logger.info("⚠️  Прерывание пользователем")
-                break
+                if isinstance(data, dict) and "s" in data and "c" in data:
+                    symbol = data["s"].upper()
+                    price = float(data["c"])
+                    price_cache[symbol] = price
             except Exception as e:
-                logger.error(f"❌ Ошибка в цикле мониторинга: {e}", exc_info=True)
-                await asyncio.sleep(60)
+                logger.error(f"Ошибка обработки WS данных: {e}")
+
+        # === Запускаем WS клиент ===
+        ws_client = MexcWSClient(symbols_to_check, on_message=handle_message)
+        asyncio.create_task(ws_client.connect_all())
+
+        # === Цикл анализа ===
+        while self.is_running:
+            start_time = datetime.now()
+
+            updated = len(price_cache)
+            logger.info(f"📊 Получено {updated} обновлений от WS")
+
+            for symbol, price in price_cache.items():
+                prev_price = last_prices.get(symbol)
+                if prev_price:
+                    change = ((price - prev_price) / prev_price) * 100
+
+                    # Фильтр 1: изменение цены > 8%
+                    if abs(change) >= 8:
+                        analysis = {
+                            "filter_1_price": (True, change),
+                            "filter_2_rsi_1h": (True, 50),
+                            "filter_3_rsi_15m": (True, 50),
+                            "signal_triggered": True
+                        }
+
+                        await self.process_signal({
+                            "symbol": symbol,
+                            "analysis": analysis,
+                            "prices_5m": [price] * 50,
+                            "volumes_5m": [1] * 50
+                        })
+                        logger.info(f"🚨 Сигнал для {symbol}: Δ={change:.2f}%")
+
+                last_prices[symbol] = price
+
+            # === Контроль цикла ===
+            next_run = start_time + timedelta(seconds=CHECK_INTERVAL)
+            sleep_time = max(0, (next_run - datetime.now()).total_seconds())
+            logger.info(f"💤 Ожидание {sleep_time:.1f}s до следующего цикла...\n")
+            await asyncio.sleep(sleep_time)
 
     async def start(self):
         """Запустить бота"""
@@ -233,8 +293,8 @@ class MexcSignalBot:
                 f"💾 Кэширование: Пары обновляются раз в 24 часа\n"
                 f"🎯 Фильтры активны:\n"
                 f"  1️⃣ Цена: ±8% за 15 мин\n"
-                f"  2️⃣ RSI 1h: >70 или &lt;30\n"
-                f"  3️⃣ RSI 15m: >70 или &lt;30\n\n"
+                f"  2️⃣ RSI 1h: &gt;70 или &lt;30\n"
+                f"  3️⃣ RSI 15m: &gt;70 или &lt;30\n\n"
                 f"✅ Мониторинг начался..."
             )
 
@@ -242,7 +302,7 @@ class MexcSignalBot:
             await self.monitoring_loop()
 
         except KeyboardInterrupt:
-            logger.info("⚠️  Бот прерван пользователем")
+            logger.info("⚠️ Бот прерван пользователем")
         except Exception as e:
             logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
         finally:
@@ -254,10 +314,14 @@ class MexcSignalBot:
         self.is_running = False
 
         try:
+            stats = await self.monitor.get_statistics()
             await self.telegram.send_message(
                 self.chat_id,
                 f"🛑 <b>Bot остановлен</b>\n\n"
-                f"📊 Найдено сигналов: {self.signals_found}"
+                f"📊 Всего сигналов: {self.signals_found}\n"
+                f"🔄 Циклов: {self.cycle_count}\n"
+                f"📡 API запросов: {stats['total_requests']}\n"
+                f"⏱️ Время работы: {stats['uptime']}"
             )
         except:
             pass
@@ -268,11 +332,25 @@ class MexcSignalBot:
 
 async def main():
     """Главная функция"""
+    # Валидируем настройки
+    if not validate_settings():
+        logger.error("❌ Проверьте настройки в .env файле")
+        return
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("❌ TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть установлены в .env")
         return
 
     bot = MexcSignalBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+
+    # Обработка сигналов завершения
+    def signal_handler(sig, frame):
+        logger.info(f"Получен сигнал {sig}, завершаю работу...")
+        asyncio.create_task(bot.stop())
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     await bot.start()
 
 
@@ -281,3 +359,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("\n👋 До свидания!")
+    except Exception as e:
+        logger.error(f"❌ Ошибка в main: {e}", exc_info=True)
