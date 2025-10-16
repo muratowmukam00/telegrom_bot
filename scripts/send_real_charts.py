@@ -9,7 +9,7 @@ async def send_real_charts():
     """Отправить реальные графики топ пар с MEXC — как будто сигнал"""
 
     telegram = TelegramService(TELEGRAM_BOT_TOKEN)
-    symbols_to_chart = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]
+    symbols_to_chart = ["BTC_USDT"]
     print("🚀 Получаем данные с MEXC и отправляем графики через TelegramService...\n")
 
     async with MexcClient() as client:
