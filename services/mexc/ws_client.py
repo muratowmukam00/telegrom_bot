@@ -139,7 +139,7 @@ class MexcWSClient:
                 if symbol and ticker_data:
                     price = float(ticker_data.get("lastPrice", 0))
                     if price > 0 and self.on_message:
-                        logger.info(f"📊 Тикер: {symbol}, цена: {price}")
+                        # logger.info(f"📊 Тикер: {symbol}, цена: {price}")
                         await self.on_message({"s": symbol, "c": price})
                 return
 
@@ -148,7 +148,7 @@ class MexcWSClient:
                 symbol = data.get("symbol")
                 price = float(data.get("lastPrice", 0))
                 if symbol and price > 0 and self.on_message:
-                    logger.info(f"📊 Тикер: {symbol}, цена: {price}")
+                    # logger.info(f"📊 Тикер: {symbol}, цена: {price}")
                     await self.on_message({"s": symbol, "c": price})
                 return
 
@@ -158,7 +158,7 @@ class MexcWSClient:
                 symbol = ticker_data.get("symbol")
                 price = float(ticker_data.get("lastPrice", 0))
                 if symbol and price > 0 and self.on_message:
-                    logger.info(f"📊 Тикер: {symbol}, цена: {price}")
+                    # logger.info(f"📊 Тикер: {symbol}, цена: {price}")
                     await self.on_message({"s": symbol, "c": price})
                 return
 
@@ -171,7 +171,7 @@ class MexcWSClient:
                     await self.on_message({"s": symbol, "c": price})
                 return
 
-            logger.warning(f"⚠️ Неизвестный формат сообщения: {data}")
+            # logger.warning(f"⚠️ Неизвестный формат сообщения: {data}")
         except (ValueError, TypeError, KeyError) as e:
             logger.debug(f"Не удалось извлечь данные тикера: {e}")
         except Exception as e:

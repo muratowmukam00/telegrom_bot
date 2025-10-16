@@ -9,8 +9,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ===== MEXC API =====
-MEXC_BASE_URL = os.getenv("MEXC_BASE_URL", "https://contract.mexc.com")
-MEXC_API_TIMEOUT = int(os.getenv("MEXC_API_TIMEOUT", 10))
+MEXC_BASE_URL = os.getenv("MEXC_BASE_URL", "https://futures.mexc.com")
+MEXC_API_TIMEOUT = int(os.getenv("MEXC_API_TIMEOUT", 30))
 
 # ===== BOT SETTINGS =====
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
