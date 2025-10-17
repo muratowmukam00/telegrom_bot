@@ -1,8 +1,15 @@
+"""
+MEXC REST API Client - Production Version
+Оптимизированный клиент с автоматическими повторами и rate limiting
+"""
+
 import aiohttp
 import asyncio
+import time
 from typing import List, Dict, Optional, Any
 from enum import Enum
 import logging
+
 from config.settings import MEXC_BASE_URL
 
 logger = logging.getLogger(__name__)
@@ -10,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 class IntervalMapping:
     """Маппинг стандартных интервалов в формат MEXC"""
+
     STANDARD_TO_MEXC = {
         "1m": "Min1",
         "5m": "Min5",
@@ -28,18 +36,6 @@ class IntervalMapping:
         return cls.STANDARD_TO_MEXC.get(interval, interval)
 
 
-class KlineIndex(Enum):
-    """Индексы данных в kline массиве (если это массив, а не dict)"""
-    TIMESTAMP = 0
-    OPEN = 1
-    HIGH = 2
-    LOW = 3
-    CLOSE = 4
-    VOLUME = 5
-    AMOUNT = 6
-    VOLUME_QUOTE = 7
-
-
 class APIError(Exception):
     """Базовая ошибка API"""
     pass
@@ -50,31 +46,106 @@ class RateLimitError(APIError):
     pass
 
 
+class RequestMetrics:
+    """Метрики API запросов"""
+
+    def __init__(self):
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.retries = 0
+        self.rate_limit_hits = 0
+        self.total_response_time = 0.0
+
+    def request_made(self):
+        self.total_requests += 1
+
+    def request_succeeded(self, response_time: float):
+        self.successful_requests += 1
+        self.total_response_time += response_time
+
+    def request_failed(self):
+        self.failed_requests += 1
+
+    def retry_attempted(self):
+        self.retries += 1
+
+    def rate_limit_hit(self):
+        self.rate_limit_hits += 1
+
+    def get_stats(self) -> Dict:
+        avg_response_time = (
+            self.total_response_time / self.successful_requests
+            if self.successful_requests > 0
+            else 0
+        )
+
+        success_rate = (
+            self.successful_requests / self.total_requests * 100
+            if self.total_requests > 0
+            else 0
+        )
+
+        return {
+            'total_requests': self.total_requests,
+            'successful': self.successful_requests,
+            'failed': self.failed_requests,
+            'retries': self.retries,
+            'rate_limit_hits': self.rate_limit_hits,
+            'success_rate': f"{success_rate:.1f}%",
+            'avg_response_time': f"{avg_response_time:.3f}s"
+        }
+
+
 class MexcClient:
     """
-    MEXC API клиент с автоматическими повторами и обработкой ошибок
+    Production MEXC API клиент
 
-    Attributes:
-        base_url: Базовый URL MEXC API
-        session: Aiohttp сессия для запросов
-        max_retries: Максимальное количество повторов при ошибке
-        timeout: Таймаут запроса в секундах
+    Features:
+    - Автоматические повторы с exponential backoff
+    - Rate limiting
+    - Connection pooling
+    - Request metrics
+    - Timeout handling
     """
 
     def __init__(
             self,
             base_url: str = MEXC_BASE_URL,
             max_retries: int = 3,
-            timeout: int = 10
+            timeout: int = 30,
+            max_connections: int = 100
     ):
         self.base_url = base_url
         self.max_retries = max_retries
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.max_connections = max_connections
         self.session: Optional[aiohttp.ClientSession] = None
+        self.metrics = RequestMetrics()
+
+        logger.debug(
+            f"Инициализация MEXC клиента: "
+            f"timeout={timeout}s, max_retries={max_retries}"
+        )
 
     async def __aenter__(self):
         """Создаём сессию при входе в контекст"""
-        self.session = aiohttp.ClientSession(timeout=self.timeout)
+        connector = aiohttp.TCPConnector(
+            limit=self.max_connections,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True
+        )
+
+        self.session = aiohttp.ClientSession(
+            timeout=self.timeout,
+            connector=connector,
+            headers={
+                'User-Agent': 'MEXC-Signal-Bot/2.0',
+                'Accept': 'application/json'
+            }
+        )
+
+        logger.debug("API сессия создана")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -82,6 +153,7 @@ class MexcClient:
         if self.session:
             await self.session.close()
             self.session = None
+            logger.debug("API сессия закрыта")
 
     async def _make_request(
             self,
@@ -97,63 +169,90 @@ class MexcClient:
             url: URL для запроса
             method: HTTP метод
             params: Query параметры
-            retry_count: Текущая попытка (для рекурсии)
+            retry_count: Текущая попытка
 
         Returns:
             JSON ответ или None при ошибке
-
-        Raises:
-            RateLimitError: При превышении лимита запросов
-            APIError: При других ошибках API
         """
         if not self.session:
             raise APIError("Session not initialized. Use 'async with' context manager.")
 
+        self.metrics.request_made()
+        start_time = time.time()
+
         try:
             async with self.session.get(url, params=params) as response:
-                # Проверяем rate limit
+                response_time = time.time() - start_time
+
+                # Rate limit
                 if response.status == 429:
-                    logger.warning(f"Rate limit hit for {url}")
+                    self.metrics.rate_limit_hit()
+                    logger.warning(f"Rate limit hit: {url}")
+
+                    # Повторяем с большей задержкой
+                    if retry_count < self.max_retries:
+                        wait_time = 2 ** (retry_count + 2)  # 4s, 8s, 16s
+                        logger.info(f"Ожидание {wait_time}s перед повтором...")
+                        await asyncio.sleep(wait_time)
+                        self.metrics.retry_attempted()
+                        return await self._make_request(url, method, params, retry_count + 1)
+
                     raise RateLimitError("API rate limit exceeded")
 
-                # Проверяем успешность запроса
+                # Ошибка сервера
                 if response.status != 200:
-                    logger.error(f"API error {response.status} for {url}")
+                    self.metrics.request_failed()
+                    logger.warning(
+                        f"HTTP {response.status} для {url}: "
+                        f"{await response.text()}"
+                    )
                     return None
 
+                # Парсим ответ
                 data = await response.json()
 
-                # Проверяем формат ответа
                 if not isinstance(data, dict):
-                    logger.error(f"Invalid response format from {url}")
+                    self.metrics.request_failed()
+                    logger.warning(f"Невалидный формат ответа: {type(data)}")
                     return None
 
+                self.metrics.request_succeeded(response_time)
                 return data
 
         except aiohttp.ClientError as e:
-            logger.error(f"Client error for {url}: {e}")
+            self.metrics.request_failed()
+            logger.warning(f"Client error для {url}: {e}")
 
-            # Повторяем запрос при сетевых ошибках
+            # Повторяем при сетевых ошибках
             if retry_count < self.max_retries:
-                wait_time = 2 ** retry_count  # Exponential backoff: 1s, 2s, 4s
-                logger.info(f"Retrying in {wait_time}s... (attempt {retry_count + 1}/{self.max_retries})")
+                wait_time = 2 ** retry_count  # 1s, 2s, 4s
+                logger.info(
+                    f"Повтор через {wait_time}s... "
+                    f"(попытка {retry_count + 1}/{self.max_retries})"
+                )
                 await asyncio.sleep(wait_time)
+                self.metrics.retry_attempted()
                 return await self._make_request(url, method, params, retry_count + 1)
 
             return None
 
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout for {url}")
+            self.metrics.request_failed()
+            logger.warning(f"Timeout для {url}")
 
             if retry_count < self.max_retries:
-                logger.info(f"Retrying... (attempt {retry_count + 1}/{self.max_retries})")
+                logger.info(
+                    f"Повтор... (попытка {retry_count + 1}/{self.max_retries})"
+                )
                 await asyncio.sleep(1)
+                self.metrics.retry_attempted()
                 return await self._make_request(url, method, params, retry_count + 1)
 
             return None
 
         except Exception as e:
-            logger.error(f"Unexpected error for {url}: {e}", exc_info=True)
+            self.metrics.request_failed()
+            logger.error(f"Неожиданная ошибка для {url}: {e}", exc_info=True)
             return None
 
     async def get_klines(
@@ -166,23 +265,18 @@ class MexcClient:
         Получить свечи (klines) для символа
 
         Args:
-            symbol: Торговая пара (например, BTC_USDT)
-            interval: Интервал свечей (1m, 5m, 15m, 1h, 4h, 1d)
-                     Автоматически конвертируется в формат MEXC (Min1, Min5, etc.)
-            limit: Количество свечей для возврата (берём последние N)
+            symbol: Торговая пара (BTC_USDT)
+            interval: Интервал (1m, 5m, 15m, 1h, 4h, 1d)
+            limit: Количество последних свечей
 
         Returns:
-            Список свечей в виде словарей
-            Каждая свеча: {"time": int, "open": float, "close": float, "high": float,
-                          "low": float, "vol": float, "amount": float}
+            Список свечей в формате dict
         """
-        # Конвертируем интервал в формат MEXC
         mexc_interval = IntervalMapping.convert(interval)
-
         url = f"{self.base_url}/api/v1/contract/kline/{symbol}"
         params = {
             "interval": mexc_interval,
-            "start": "",  # MEXC требует эти параметры, даже пустые
+            "start": "",
             "end": ""
         }
 
@@ -190,42 +284,42 @@ class MexcClient:
             data = await self._make_request(url, params=params)
 
             if not data:
-                logger.warning(f"No response for {symbol} ({interval})")
                 return []
 
-            # Проверяем успешность запроса
             if not data.get("success"):
-                logger.warning(f"API error for {symbol}: {data.get('message', 'Unknown error')}")
+                logger.debug(
+                    f"API error для {symbol}: {data.get('message', 'Unknown')}"
+                )
                 return []
 
             raw_data = data.get("data", {})
 
-            # MEXC возвращает данные в формате словаря массивов:
-            # {"time": [...], "open": [...], "close": [...], ...}
             if not isinstance(raw_data, dict):
-                logger.error(f"Invalid klines format for {symbol}")
                 return []
 
-            # Преобразуем в список словарей
             klines = self._transform_klines(raw_data, limit)
 
-            logger.debug(f"Got {len(klines)} klines for {symbol} ({interval} -> {mexc_interval})")
+            if klines:
+                logger.debug(
+                    f"Получено {len(klines)} свечей для {symbol} ({interval})"
+                )
+
             return klines
 
         except Exception as e:
-            logger.error(f"Error getting klines for {symbol}: {e}")
+            logger.error(f"Ошибка get_klines для {symbol}: {e}")
             return []
 
-    def _transform_klines(self, raw_data: Dict[str, List], limit: int) -> List[Dict[str, Any]]:
+    def _transform_klines(
+            self,
+            raw_data: Dict[str, List],
+            limit: int
+    ) -> List[Dict[str, Any]]:
         """
-        Преобразовать формат MEXC (словарь массивов) в список словарей
+        Преобразовать формат MEXC в список словарей
 
-        Args:
-            raw_data: Сырые данные от MEXC API
-            limit: Количество последних свечей для возврата
-
-        Returns:
-            Список свечей в удобном формате
+        MEXC формат: {"time": [...], "open": [...], "close": [...], ...}
+        Наш формат: [{"time": x, "open": y, "close": z, ...}, ...]
         """
         try:
             times = raw_data.get("time", [])
@@ -236,10 +330,10 @@ class MexcClient:
             volumes = raw_data.get("vol", [])
             amounts = raw_data.get("amount", [])
 
-            # Проверяем что все массивы одной длины
+            # Проверка длины
             lengths = [len(times), len(opens), len(closes), len(highs), len(lows)]
             if not all(l == lengths[0] for l in lengths):
-                logger.error("Klines arrays have different lengths")
+                logger.warning("Массивы klines разной длины")
                 return []
 
             # Собираем свечи
@@ -256,23 +350,15 @@ class MexcClient:
                 }
                 klines.append(kline)
 
-            # Возвращаем последние N свечей
+            # Возвращаем последние N
             return klines[-limit:] if limit < len(klines) else klines
 
         except Exception as e:
-            logger.error(f"Error transforming klines: {e}")
+            logger.error(f"Ошибка transform_klines: {e}")
             return []
 
     def extract_close_prices(self, klines: List[Dict[str, Any]]) -> List[float]:
-        """
-        Извлечь цены закрытия из klines
-
-        Args:
-            klines: Список свечей от API (dict формат)
-
-        Returns:
-            Список цен закрытия
-        """
+        """Извлечь цены закрытия"""
         try:
             return [
                 float(kline.get("close", 0))
@@ -280,19 +366,11 @@ class MexcClient:
                 if isinstance(kline, dict) and kline.get("close")
             ]
         except (ValueError, TypeError) as e:
-            logger.error(f"Error extracting close prices: {e}")
+            logger.error(f"Ошибка extract_close_prices: {e}")
             return []
 
     def extract_volumes(self, klines: List[Dict[str, Any]]) -> List[float]:
-        """
-        Извлечь объёмы из klines
-
-        Args:
-            klines: Список свечей от API (dict формат)
-
-        Returns:
-            Список объёмов
-        """
+        """Извлечь объёмы"""
         try:
             return [
                 float(kline.get("vol", 0))
@@ -300,50 +378,54 @@ class MexcClient:
                 if isinstance(kline, dict) and kline.get("vol")
             ]
         except (ValueError, TypeError) as e:
-            logger.error(f"Error extracting volumes: {e}")
+            logger.error(f"Ошибка extract_volumes: {e}")
             return []
 
     async def get_all_symbols(self) -> List[str]:
         """
-        Получить список всех USDT фьючерсных пар (корректно)
+        Получить список всех USDT фьючерсных пар
+
+        Returns:
+            Список символов формата SYMBOL_USDT
         """
-        url = f"{self.base_url}/api/v1/contract/pair/list"
+        url = f"{self.base_url}/api/v1/contract/detail"
 
         try:
             data = await self._make_request(url)
 
-            if not data or "data" not in data:
-                logger.error("No symbols data from API")
+            if not data or not data.get("success"):
+                logger.error("Не удалось получить список пар")
                 return []
 
-            contracts = data["data"]
+            contracts = data.get("data", [])
+
             if not isinstance(contracts, list):
-                logger.error("Invalid contracts format")
+                logger.error(f"Невалидный формат contracts: {type(contracts)}")
                 return []
 
-            # Фильтруем только USDT фьючерсные пары
-            symbols = [
+            # Фильтруем USDT пары
+            symbols = sorted([
                 c["symbol"]
                 for c in contracts
-                if isinstance(c, dict) and c.get("quoteCurrency") == "USDT"
-            ]
+                if isinstance(c, dict) and c.get("symbol", "").endswith("_USDT")
+            ])
 
-            logger.info(f"Found {len(symbols)} USDT futures pairs ✅")
+            logger.info(f"Получено {len(symbols)} USDT фьючерсных пар")
             return symbols
 
         except Exception as e:
-            logger.error(f"Error getting futures pairs: {e}", exc_info=True)
+            logger.error(f"Ошибка get_all_symbols: {e}", exc_info=True)
             return []
 
     async def get_24h_price_change(self, symbol: str) -> Optional[float]:
         """
-        Получить изменение цены за 24 часа в процентах
+        Получить изменение цены за 24 часа
 
         Args:
             symbol: Торговая пара
 
         Returns:
-            Процент изменения цены или None при ошибке
+            Процент изменения или None
         """
         url = f"{self.base_url}/api/v1/contract/ticker"
         params = {"symbol": symbol}
@@ -351,12 +433,7 @@ class MexcClient:
         try:
             data = await self._make_request(url, params=params)
 
-            if not data:
-                return None
-
-            # Проверяем успешность
-            if not data.get("success"):
-                logger.warning(f"Ticker API error: {data.get('message')}")
+            if not data or not data.get("success"):
                 return None
 
             ticker_data = data.get("data")
@@ -364,13 +441,13 @@ class MexcClient:
             if not ticker_data:
                 return None
 
-            # Если это список, берем первый элемент
+            # Если список, берём первый элемент
             if isinstance(ticker_data, list):
                 if len(ticker_data) == 0:
                     return None
                 ticker_data = ticker_data[0]
 
-            # MEXC использует поле "riseFallRate" для 24h изменения
+            # MEXC использует "riseFallRate"
             price_change = ticker_data.get("riseFallRate")
 
             if price_change is None:
@@ -379,35 +456,44 @@ class MexcClient:
             return float(price_change)
 
         except (ValueError, TypeError) as e:
-            logger.error(f"Error parsing price change for {symbol}: {e}")
+            logger.debug(f"Ошибка парсинга 24h change для {symbol}: {e}")
             return None
         except Exception as e:
-            logger.error(f"Error getting price change for {symbol}: {e}")
+            logger.error(f"Ошибка get_24h_price_change для {symbol}: {e}")
             return None
 
+    def get_metrics(self) -> Dict:
+        """Получить метрики API запросов"""
+        return self.metrics.get_stats()
 
-# Пример использования
-async def example_usage():
-    """Пример использования улучшенного клиента"""
-    async with MexcClient() as client:
-        # Получаем все символы
+
+# === Пример использования ===
+async def example():
+    """Пример использования production клиента"""
+
+    async with MexcClient(timeout=30) as client:
+        # Получаем символы
         symbols = await client.get_all_symbols()
-        print(f"Found {len(symbols)} symbols")
+        logger.info(f"Найдено {len(symbols)} символов")
 
         # Получаем klines для BTC
         klines = await client.get_klines("BTC_USDT", "1m", 100)
 
-        # Извлекаем цены и объёмы
-        prices = client.extract_close_prices(klines)
-        volumes = client.extract_volumes(klines)
+        if klines:
+            prices = client.extract_close_prices(klines)
+            logger.info(
+                f"BTC_USDT: {len(prices)} свечей, "
+                f"цена: {prices[-1] if prices else 'N/A'}"
+            )
 
-        print(f"Got {len(prices)} prices, last: {prices[-1] if prices else 'N/A'}")
-        print(f"Got {len(volumes)} volumes")
-
-        # Получаем изменение за 24ч
+        # Получаем 24h изменение
         change = await client.get_24h_price_change("BTC_USDT")
-        print(f"24h change: {change}%")
+        logger.info(f"24h изменение: {change}%")
+
+        # Метрики
+        logger.info(f"Метрики API: {client.get_metrics()}")
 
 
 if __name__ == "__main__":
-    asyncio.run(example_usage())
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(example())
