@@ -353,36 +353,34 @@ class HybridMonitor:
             rsi_1h: float,
             rsi_15m: float
     ):
-        """Отправка сигнала в Telegram"""
+        """Отправка сигнала в Telegram (в одном сообщении с графиком и подробным caption)"""
         try:
             self.signals_found += 1
             self.last_signal_time[symbol] = time.time()
-
             logger.warning(f"🚨 SIGNAL FOUND: {symbol}!")
 
             # Получаем данные для графика (5m)
             candles_5m = await self._get_klines_cached(symbol, "5m", 144)
             if not candles_5m:
-                # Попытаемся напрямую запросить, если cache пуст
                 try:
                     async with MexcClient(timeout=30) as client:
                         candles_5m = await client.get_klines(symbol, "5m", 144)
                 except Exception as e:
                     logger.error(f"Не удалось получить 5m для графика {symbol}: {e}")
 
-            analysis = {
-                'signal_triggered': True,
-                'filter_1_price': (True, price_change),
-                'filter_2_rsi_1h': (True, rsi_1h),
-                'filter_3_rsi_15m': (True, rsi_15m),
-            }
+            # === Дополнительные данные (24h volume, change) ===
+            try:
+                async with MexcClient(timeout=30) as client:
+                    ticker_data = await client.get_ticker(symbol)
+                volume_24h = float(ticker_data.get("quoteVolume", 0)) / 1_000_000  # млн
+                change_24h = float(ticker_data.get("priceChangePercent", 0))
+                last_price = float(ticker_data.get("lastPrice", 0))
+                open_price = float(ticker_data.get("openPrice", 0))
+            except Exception as e:
+                logger.error(f"Ошибка получения 24h данных для {symbol}: {e}")
+                volume_24h, change_24h, last_price, open_price = 0, 0, 0, 0
 
-            await self.telegram.send_signal_alert(
-                self.chat_id,
-                symbol,
-                analysis
-            )
-
+            # === Генерация графика ===
             if candles_5m and len(candles_5m) > 0:
                 Path("charts").mkdir(exist_ok=True)
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -395,23 +393,29 @@ class HybridMonitor:
                 )
 
                 if chart_path and Path(chart_path).exists():
+                    # === Формируем Telegram caption ===
                     caption = (
-                        f"📊 <b>{symbol}</b> — Сигнал по RSI\n\n"
-                        f"📈 Цена: {price_change:+.2f}%\n"
-                        f"🔴 RSI 1h: {rsi_1h:.1f}\n"
-                        f"🔴 RSI 15m: {rsi_15m:.1f}"
+                        f"#{symbol}  <b>{symbol}</b>\n\n"
+                        f"🟩 <b>{price_change:+.2f}%</b>\n"
+                        f"{open_price:.6f} → {last_price:.6f} USDT (за 15 мин)\n\n"
+                        f"RSI 1h: <b>{rsi_1h:.2f}</b>\n"
+                        f"RSI 15m: <b>{rsi_15m:.2f}</b>\n"
+                        f"Объём 24h: <b>{volume_24h:.2f}M</b>\n"
+                        f"Изменение 24h: <b>{change_24h:+.2f}%</b>"
                     )
 
                     await self.telegram.send_photo(
                         chat_id=self.chat_id,
                         photo_path=chart_path,
-                        caption=caption
+                        caption=caption,
+                        parse_mode="HTML"
                     )
-                    logger.info(f"✅ График отправлен для {symbol}")
+                    logger.info(f"✅ Сигнал (в одном сообщении) отправлен для {symbol}")
 
         except Exception as e:
             self.errors_count += 1
             logger.error(f"Ошибка отправки сигнала {symbol}: {e}", exc_info=True)
+
 
     # -----------------------
     # Per-minute full rescan (failsafe)
