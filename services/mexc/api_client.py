@@ -462,6 +462,29 @@ class MexcClient:
             logger.error(f"Ошибка get_24h_price_change для {symbol}: {e}")
             return None
 
+    async def get_full_ticker(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Получить полные 24h данные по монете"""
+        try:
+            url = f"{self.base_url}/api/v3/ticker/24hr?symbol={symbol.upper()}"
+            async with self.session.get(url, timeout=self.timeout) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return {
+                    "symbol": data.get("symbol"),
+                    "lastPrice": float(data.get("lastPrice", 0)),
+                    "openPrice": float(data.get("openPrice", 0)),
+                    "highPrice": float(data.get("highPrice", 0)),
+                    "lowPrice": float(data.get("lowPrice", 0)),
+                    "priceChange": float(data.get("priceChange", 0)),
+                    "priceChangePercent": float(data.get("priceChangePercent", 0)),
+                    "volume": float(data.get("volume", 0)),
+                    "quoteVolume": float(data.get("quoteVolume", 0))
+                }
+        except Exception as e:
+            print(f"Ошибка get_full_ticker({symbol}): {e}")
+            return None
+
     def get_metrics(self) -> Dict:
         """Получить метрики API запросов"""
         return self.metrics.get_stats()

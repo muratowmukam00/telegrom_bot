@@ -371,14 +371,20 @@ class HybridMonitor:
             # === Дополнительные данные (24h volume, change) ===
             try:
                 async with MexcClient(timeout=30) as client:
-                    ticker_data = await client.get_ticker(symbol)
-                volume_24h = float(ticker_data.get("quoteVolume", 0)) / 1_000_000  # млн
-                change_24h = float(ticker_data.get("priceChangePercent", 0))
-                last_price = float(ticker_data.get("lastPrice", 0))
-                open_price = float(ticker_data.get("openPrice", 0))
+                    ticker_data = await client.get_full_ticker(symbol)
+
+                if ticker_data:
+                    volume_24h = ticker_data["quoteVolume"] / 1_000_000  # млн USDT
+                    change_24h = ticker_data["priceChangePercent"]
+                    last_price = ticker_data["lastPrice"]
+                    open_price = ticker_data["openPrice"]
+                    high_price = ticker_data["highPrice"]
+                    low_price = ticker_data["lowPrice"]
+                else:
+                    volume_24h = change_24h = last_price = open_price = high_price = low_price = 0
             except Exception as e:
-                logger.error(f"Ошибка получения 24h данных для {symbol}: {e}")
-                volume_24h, change_24h, last_price, open_price = 0, 0, 0, 0
+                logger.error(f"Ошибка получения full ticker для {symbol}: {e}")
+                volume_24h = change_24h = last_price = open_price = high_price = low_price = 0
 
             # === Генерация графика ===
             if candles_5m and len(candles_5m) > 0:
@@ -396,8 +402,9 @@ class HybridMonitor:
                     # === Формируем Telegram caption ===
                     caption = (
                         f"#{symbol}  <b>{symbol}</b>\n\n"
-                        f"🟩 <b>{price_change:+.2f}%</b>\n"
-                        f"{open_price:.6f} → {last_price:.6f} USDT (за 15 мин)\n\n"
+                        f"🟩 <b>{price_change:+.2f}%</b> за 15 мин\n"
+                        f"{open_price:.6f} → {last_price:.6f} USDT\n"
+                        f"High/Low 24h: {high_price:.6f} / {low_price:.6f}\n\n"
                         f"RSI 1h: <b>{rsi_1h:.2f}</b>\n"
                         f"RSI 15m: <b>{rsi_15m:.2f}</b>\n"
                         f"Объём 24h: <b>{volume_24h:.2f}M</b>\n"
