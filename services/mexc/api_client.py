@@ -465,10 +465,15 @@ class MexcClient:
     async def get_full_ticker(self, symbol: str) -> Optional[Dict[str, float]]:
         """Получить полные 24h данные по монете"""
         try:
-            url = f"{self.base_url}/api/v3/ticker/24hr?symbol={symbol.upper()}"
+            # ✅ '_'-lary aýyr, soňra UPPER
+            clean_symbol = symbol.replace('_', '').upper()
+            url = f"{self.base_url}/api/v3/ticker/24hr?symbol={clean_symbol}"
+
             async with self.session.get(url, timeout=self.timeout) as resp:
                 if resp.status != 200:
+                    print(f"⚠️ get_full_ticker({symbol}) status={resp.status}")
                     return None
+
                 data = await resp.json()
                 return {
                     "symbol": data.get("symbol"),

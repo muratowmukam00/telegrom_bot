@@ -400,9 +400,11 @@ class HybridMonitor:
 
                 if chart_path and Path(chart_path).exists():
                     # === Формируем Telegram caption ===
+                    price_change_for_caption = price_change if last_price >= open_price else -price_change
+                    color_emoji = "🟩" if price_change_for_caption > 0 else "🟥"
                     caption = (
                         f"#{symbol}  <b>{symbol}</b>\n\n"
-                        f"🟩 <b>{price_change:+.2f}%</b> за 15 мин\n"
+                        f"{color_emoji} <b>{price_change_for_caption:+.2f}%</b> за 15 мин\n"
                         f"{open_price:.6f} → {last_price:.6f} USDT\n"
                         f"High/Low 24h: {high_price:.6f} / {low_price:.6f}\n\n"
                         f"RSI 1h: <b>{rsi_1h:.2f}</b>\n"
