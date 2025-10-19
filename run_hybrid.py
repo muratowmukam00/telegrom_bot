@@ -529,16 +529,23 @@ class HybridMonitor:
 
             logger.info(f"📊 Загружено {len(symbols)} USDT пар")
 
+            startup_message = (
+                f"👋 Привет! <b>MEXC Signal Bot</b> запущен 🎉\n\n"
+                f"📊 Сейчас мониторим <b>{len(symbols)}</b> пар\n"
+                f"🔍 Используемые фильтры:\n"
+                f"  • Изменение цены: ±<b>{PRICE_CHANGE_THRESHOLD}%</b> за 15 минут\n"
+                f"  • RSI 1h: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> (основной)\n"
+                f"  • RSI 15m: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> (подтверждение)\n"
+                f"  • Cooldown: <b>{self.cooldown} сек</b>\n\n"
+                f"🌐 Источник данных: WebSocket + REST API (workers={self.worker_count})\n\n"
+                f"🟢 Бот готов! Когда появится новый сигнал, вы получите уведомление 🚀\n\n"
+                f"💰 Удачной торговли и прибыльных сделок!"
+            )
+
             await self.telegram.send_message(
                 self.chat_id,
-                f"✅ <b>MEXC Signal Bot (optimized) запущен</b>\n\n"
-                f"📊 Пар в мониторинге: {len(symbols)}\n"
-                f"🔍 Фильтры:\n"
-                f"  • Цена: ±{PRICE_CHANGE_THRESHOLD}% за 15 мин\n"
-                f"  • RSI 1h: &gt;{RSI_OVERBOUGHT} или &lt;{RSI_OVERSOLD} (первично)\n"
-                f"  • RSI 15m: &gt;{RSI_OVERBOUGHT} или &lt;{RSI_OVERSOLD} (подтверждение)\n"
-                f"  • Cooldown: {self.cooldown} сек\n\n"
-                f"🌐 Источник: WebSocket + REST API (workers={self.worker_count})"
+                startup_message,
+                parse_mode="HTML"
             )
 
             # Создаём WebSocket клиент
