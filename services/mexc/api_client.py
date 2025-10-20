@@ -465,7 +465,6 @@ class MexcClient:
     async def get_full_ticker(self, symbol: str) -> Optional[Dict[str, float]]:
         """Получить полные 24h данные по монете (фьючерсы)"""
         try:
-            # Используем CONTRACT ticker endpoint
             url = f"{self.base_url}/api/v1/contract/ticker"
             params = {"symbol": symbol}
 
@@ -476,28 +475,59 @@ class MexcClient:
                 return None
 
             ticker_data = data.get("data")
-
             if not ticker_data:
                 return None
 
-            # Если список, берём первый элемент
             if isinstance(ticker_data, list):
                 if len(ticker_data) == 0:
                     return None
                 ticker_data = ticker_data[0]
 
-            # Парсим данные фьючерсов
+            # Esasy maglumatlar
+            last_price = float(ticker_data.get("lastPrice", 0) or 0)
+            open_price = float(ticker_data.get("openPrice", 0) or 0)
+            high_price = float(ticker_data.get("high24Price", 0) or 0)
+            low_price = float(ticker_data.get("low24Price", 0) or 0)
+            price_change = float(ticker_data.get("riseFallValue", 0) or 0)
+            price_change_percent = float(ticker_data.get("riseFallRate", 0) or 0)
+            volume = float(ticker_data.get("volume24", 0) or 0)
+            quote_volume = float(ticker_data.get("amount24", 0) or 0)
+
+            # 🟡 Eger baha 0 bolsa, "contract/detail" bilen doldur
+            if last_price == 0 or high_price == 0 or low_price == 0:
+                detail_url = f"{self.base_url}/api/v1/contract/detail"
+                detail_data = await self._make_request(detail_url, params=params)
+
+                if detail_data and detail_data.get("success") and detail_data.get("data"):
+                    d = detail_data["data"]
+
+                    # Doly baha maglumatlary almak
+                    fair_price = float(d.get("fairPrice", 0) or 0)
+                    index_price = float(d.get("indexPrice", 0) or 0)
+
+                    # Eger mümkin bolsa fairPrice ulan, bolmasa indexPrice
+                    backup_price = fair_price or index_price
+
+                    if last_price == 0:
+                        last_price = backup_price
+                    if high_price == 0:
+                        high_price = backup_price
+                    if low_price == 0:
+                        low_price = backup_price
+
+            # Netije şol öňki ýaly — logika üýtgemeýär
             return {
                 "symbol": ticker_data.get("symbol", symbol),
-                "lastPrice": float(ticker_data.get("lastPrice", 0)),
-                "openPrice": float(ticker_data.get("openPrice", 0)),
-                "highPrice": float(ticker_data.get("high24Price", 0)),
-                "lowPrice": float(ticker_data.get("low24Price", 0)),
-                "priceChange": float(ticker_data.get("riseFallValue", 0)),
-                "priceChangePercent": float(ticker_data.get("riseFallRate", 0)),
-                "volume": float(ticker_data.get("volume24", 0)),
-                "quoteVolume": float(ticker_data.get("amount24", 0))
+                "lastPrice": last_price,
+                "openPrice": open_price,
+                "highPrice": high_price,
+                "lowPrice": low_price,
+                "priceChange": price_change,
+                "priceChangePercent": price_change_percent,
+                "volume": volume,
+                "quoteVolume": quote_volume
             }
+
         except Exception as e:
             logger.error(f"Ошибка get_full_ticker({symbol}): {e}")
             return None

@@ -348,85 +348,45 @@ class HybridMonitor:
     # -----------------------
     # Send signal (telegram + chart)
     # -----------------------
-    async def send_signal(
-            self,
-            symbol: str,
-            price_change: float,
-            rsi_1h: float,
-            rsi_15m: float
-    ):
-        """Отправка сигнала в Telegram (в одном сообщении с графиком и подробным caption)"""
-        try:
-            self.signals_found += 1
-            self.last_signal_time[symbol] = time.time()
-            logger.warning(f"🚨 SIGNAL FOUND: {symbol}!")
+    async def send_signal(symbol: str, price_change_for_caption: float,
+                          open_price: float, last_price: float,
+                          high_price: float, low_price: float,
+                          rsi_1h: float, rsi_15m: float,
+                          volume_24h: float, change_24h: float,
+                          telegram_service):
+        """Отправка сигнала в Telegram с защитой от нулевых цен"""
 
-            # Получаем данные для графика (5m)
-            candles_5m = await self._get_klines_cached(symbol, "5m", 144)
-            if not candles_5m:
-                try:
-                    async with MexcClient(timeout=30) as client:
-                        candles_5m = await client.get_klines(symbol, "5m", 144)
-                except Exception as e:
-                    logger.error(f"Не удалось получить 5m для графика {symbol}: {e}")
+        # --- emoji boýunjyna
+        color_emoji = "🟩" if price_change_for_caption > 0 else "🟥" if price_change_for_caption < 0 else "⬜"
 
-            # === Дополнительные данные (24h volume, change) ===
+        # --- 0 ýa-da None bahalary üçin kömekçi funksiýa
+        def safe_price(value):
             try:
-                async with MexcClient(timeout=30) as client:
-                    ticker_data = await client.get_full_ticker(symbol)
-
-                if ticker_data:
-                    volume_24h = ticker_data["quoteVolume"] / 1_000_000  # млн USDT
-                    change_24h = ticker_data["priceChangePercent"]
-                    last_price = ticker_data["lastPrice"]
-                    open_price = ticker_data["openPrice"]
-                    high_price = ticker_data["highPrice"]
-                    low_price = ticker_data["lowPrice"]
+                if value and float(value) > 0:
+                    return f"{float(value):.6f}"
                 else:
-                    volume_24h = change_24h = last_price = open_price = high_price = low_price = 0
-            except Exception as e:
-                logger.error(f"Ошибка получения full ticker для {symbol}: {e}")
-                volume_24h = change_24h = last_price = open_price = high_price = low_price = 0
+                    return "—"
+            except Exception:
+                return "—"
 
-            # === Генерация графика ===
-            if candles_5m and len(candles_5m) > 0:
-                Path("charts").mkdir(exist_ok=True)
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                chart_path = f"charts/{symbol}_{timestamp}_signal.png"
+        # --- caption döretmek
+        caption = (
+            f"#{symbol}  <b>{symbol}</b>\n\n"
+            f"{color_emoji} <b>{price_change_for_caption:+.2f}%</b> за 15 мин\n"
+            f"{safe_price(open_price)} → {safe_price(last_price)} USDT\n"
+            f"High/Low 24h: {safe_price(high_price)} / {safe_price(low_price)}\n\n"
+            f"RSI 1h: <b>{rsi_1h:.2f}</b>\n"
+            f"RSI 15m: <b>{rsi_15m:.2f}</b>\n"
+            f"Объём 24h: <b>{volume_24h:.2f}M</b>\n"
+            f"Изменение 24h: <b>{change_24h:+.2f}%</b>"
+        )
 
-                chart_path = ChartGenerator.generate_signal_chart(
-                    symbol=symbol,
-                    candles=candles_5m,
-                    output_path=chart_path
-                )
-
-                if chart_path and Path(chart_path).exists():
-                    # === Формируем Telegram caption ===
-                    price_change_for_caption = price_change if last_price >= open_price else -price_change
-                    color_emoji = "🟩" if price_change_for_caption > 0 else "🟥"
-                    caption = (
-                        f"#{symbol}  <b>{symbol}</b>\n\n"
-                        f"{color_emoji} <b>{price_change_for_caption:+.2f}%</b> за 15 мин\n"
-                        f"{open_price:.6f} → {last_price:.6f} USDT\n"
-                        f"High/Low 24h: {high_price:.6f} / {low_price:.6f}\n\n"
-                        f"RSI 1h: <b>{rsi_1h:.2f}</b>\n"
-                        f"RSI 15m: <b>{rsi_15m:.2f}</b>\n"
-                        f"Объём 24h: <b>{volume_24h:.2f}M</b>\n"
-                        f"Изменение 24h: <b>{change_24h:+.2f}%</b>"
-                    )
-
-                    await self.telegram.send_photo(
-                        chat_id=self.chat_id,
-                        photo_path=chart_path,
-                        caption=caption,
-                        parse_mode="HTML"
-                    )
-                    logger.info(f"✅ Сигнал (в одном сообщении) отправлен для {symbol}")
-
+        # --- telegram-a ugratmak
+        try:
+            await telegram_service.send_photo_with_caption(symbol, caption)
+            logging.info(f"✅ Сигнал отправлен: {symbol}")
         except Exception as e:
-            self.errors_count += 1
-            logger.error(f"Ошибка отправки сигнала {symbol}: {e}", exc_info=True)
-
+            logging.error(f"Ошибка при отправке сигнала для {symbol}: {e}")
 
     # -----------------------
     # Per-minute full rescan (failsafe)
@@ -538,7 +498,6 @@ class HybridMonitor:
                 f"  • Изменение цены: ±<b>{PRICE_CHANGE_THRESHOLD}%</b> за 15 минут\n"
                 f"  • RSI 1h: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> \n"
                 f"  • RSI 15m: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> \n\n"
-                f"🌐 Источник данных: https://contract.mexc.com \n\n"
                 f"🟢 Бот готов! Когда появится новый сигнал, вы получите уведомление 🚀\n\n"
                 f"💰 Удачной торговли и прибыльных сделок!"
             )
