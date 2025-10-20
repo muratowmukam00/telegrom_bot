@@ -157,16 +157,16 @@ class HybridMonitor:
             logger.error(f"Ошибка обработки WS: {e}", exc_info=True)
 
     async def _maybe_enqueue_price_alert(self, symbol: str):
-        """Проверка движения цены с cooldown на ПРОВЕРКУ (не на сигнал)"""
+        """Проверка движения цены с cooldown и дедупликацией"""
         if len(self.prices[symbol]) < 2:
             return
 
         now = time.time()
 
-        # ⚡ ИСПРАВЛЕНО: Проверяем cooldown на ПРОВЕРКУ (не на сигнал)
+        # Проверяем check_cooldown
         last_check = self.last_check_time.get(symbol, 0)
         if now - last_check < self.check_cooldown:
-            return  # Эту монету проверяли недавно
+            return
 
         cutoff_time = now - 900
 
@@ -185,11 +185,18 @@ class HybridMonitor:
         new_price = pr[-1]
         price_change = abs((new_price - old_price) / old_price * 100)
 
+        # Дедупликация: проверяем, был ли похожий алерт недавно
+        last_alert_key = f"{symbol}_last_alert"
+        last_alert = self._klines_cache.get(last_alert_key, (0, 0))  # (время, изменение цены)
+        if now - last_alert[0] < 60 and abs(price_change - last_alert[1]) < 0.5:  # Похожий алерт в последние 60с
+            return
+
         if price_change >= PRICE_CHANGE_THRESHOLD:
             self.price_alerts += 1
-            # ⚡ ИСПРАВЛЕНО: Обновляем last_check_time СРАЗУ при enqueue
             self.last_check_time[symbol] = now
-            logger.info(f"[PRICE ALERT] {symbol}: {price_change:.2f}% за 15 мин (enqueue)")
+            self._klines_cache[last_alert_key] = (now, price_change)
+            logger.info(f"[PRICE ALERT] {symbol}: {price_change:.2f}% за 15 мин (enqueue) "
+                        f"[old_price={old_price:.6f}, new_price={new_price:.6f}]")
             await self.verify_queue.put((symbol, price_change, now))
 
     async def _verify_worker(self, worker_id: int):
@@ -232,7 +239,7 @@ class HybridMonitor:
         logger.info(f"RSI worker #{worker_id} завершён")
 
     async def verify_with_rsi(self, symbol: str, price_change: float):
-        """Проверка RSI (сначала 1h, потом 15m только если 1h экстремальный)"""
+        """Проверка RSI с кэшированием"""
         try:
             t_start = time.time()
             logger.info(f"[RSI CHECK] {symbol}")
@@ -243,38 +250,53 @@ class HybridMonitor:
                 logger.debug(f"verify_with_rsi: signal cooldown active for {symbol}")
                 return
 
-            klines_1h = await self._get_klines_cached(symbol, "1h", 100)
-            if not klines_1h:
-                logger.warning(f"Нет 1h данных для {symbol}")
-                return
+            # Проверяем кэш RSI
+            rsi_cache_key = f"{symbol}_rsi_1h"
+            cached_rsi = self._klines_cache.get(rsi_cache_key)
+            if cached_rsi and now - cached_rsi[0] < KLINES_CACHE_TTL:
+                rsi_1h = cached_rsi[1]
+                logger.debug(f"Используем кэшированный RSI 1h для {symbol}: {rsi_1h:.1f}")
+            else:
+                klines_1h = await self._get_klines_cached(symbol, "1h", 100)
+                if not klines_1h:
+                    logger.warning(f"Нет 1h данных для {symbol}")
+                    return
 
-            prices_1h = [float(k.get("close", 0)) for k in klines_1h]
-            if len(prices_1h) < 30:
-                logger.debug(f"Недостаточно 1h данных для {symbol}")
-                return
+                prices_1h = [float(k.get("close", 0)) for k in klines_1h]
+                if len(prices_1h) < 30:
+                    logger.debug(f"Недостаточно 1h данных для {symbol}")
+                    return
 
-            rsi_1h = RSICalculator.get_last_rsi(prices_1h, RSI_PERIOD)
+                rsi_1h = RSICalculator.get_last_rsi(prices_1h, RSI_PERIOD)
+                self._klines_cache[rsi_cache_key] = (now, rsi_1h)
+
             rsi_1h_passed = rsi_1h > RSI_OVERBOUGHT or rsi_1h < RSI_OVERSOLD
-
             logger.info(f"  RSI 1h: {rsi_1h:.1f} ({'✓' if rsi_1h_passed else '✗'})")
 
             if not rsi_1h_passed:
                 logger.debug(f"{symbol}: RSI 1h нейтральный ({rsi_1h:.1f}), пропускаем RSI 15m")
                 return
 
-            klines_15m = await self._get_klines_cached(symbol, "15m", 100)
-            if not klines_15m:
-                logger.warning(f"Нет 15m данных для {symbol}")
-                return
+            rsi_cache_key_15m = f"{symbol}_rsi_15m"
+            cached_rsi_15m = self._klines_cache.get(rsi_cache_key_15m)
+            if cached_rsi_15m and now - cached_rsi_15m[0] < KLINES_CACHE_TTL:
+                rsi_15m = cached_rsi_15m[1]
+                logger.debug(f"Используем кэшированный RSI 15m для {symbol}: {rsi_15m:.1f}")
+            else:
+                klines_15m = await self._get_klines_cached(symbol, "15m", 100)
+                if not klines_15m:
+                    logger.warning(f"Нет 15m данных для {symbol}")
+                    return
 
-            prices_15m = [float(k.get("close", 0)) for k in klines_15m]
-            if len(prices_15m) < 30:
-                logger.debug(f"Недостаточно 15m данных для {symbol}")
-                return
+                prices_15m = [float(k.get("close", 0)) for k in klines_15m]
+                if len(prices_15m) < 30:
+                    logger.debug(f"Недостаточно 15m данных для {symbol}")
+                    return
 
-            rsi_15m = RSICalculator.get_last_rsi(prices_15m, RSI_PERIOD)
+                rsi_15m = RSICalculator.get_last_rsi(prices_15m, RSI_PERIOD)
+                self._klines_cache[rsi_cache_key_15m] = (now, rsi_15m)
+
             rsi_15m_passed = rsi_15m > RSI_OVERBOUGHT or rsi_15m < RSI_OVERSOLD
-
             logger.info(f"  RSI 15m: {rsi_15m:.1f} ({'✓' if rsi_15m_passed else '✗'})")
 
             if rsi_1h_passed and rsi_15m_passed:
@@ -287,6 +309,7 @@ class HybridMonitor:
         except Exception as e:
             self.errors_count += 1
             logger.error(f"Ошибка RSI для {symbol}: {e}", exc_info=True)
+
 
     async def _get_klines_cached(self, symbol: str, interval: str, limit: int):
         """Возвращает klines из cache или делает REST-запрос"""
@@ -379,7 +402,7 @@ class HybridMonitor:
             logger.error(f"Ошибка отправки сигнала {symbol}: {e}", exc_info=True)
 
     async def per_minute_rescan(self, symbols: List[str]):
-        """Каждую минуту rescan с учётом last_check_time"""
+        """Каждую минуту rescan с учётом last_check_time и дедупликации"""
         logger.info("per_minute_rescan started")
         while self.is_running:
             try:
@@ -390,7 +413,6 @@ class HybridMonitor:
                 cutoff_time = now - 900
 
                 for symbol in symbols:
-                    # ⚡ ИСПРАВЛЕНО: Проверяем check cooldown
                     last_check = self.last_check_time.get(symbol, 0)
                     if now - last_check < self.check_cooldown:
                         continue
@@ -411,9 +433,16 @@ class HybridMonitor:
 
                     new_price = pr[-1]
                     price_change = abs((new_price - old_price) / old_price * 100)
+
+                    # Дедупликация: проверяем последний алерт
+                    last_alert_key = f"{symbol}_last_alert"
+                    last_alert = self._klines_cache.get(last_alert_key, (0, 0))
+                    if now - last_alert[0] < 60 and abs(price_change - last_alert[1]) < 0.5:
+                        continue
+
                     if price_change >= PRICE_CHANGE_THRESHOLD:
-                        # ⚡ ИСПРАВЛЕНО: Обновляем last_check_time
                         self.last_check_time[symbol] = now
+                        self._klines_cache[last_alert_key] = (now, price_change)
                         await self.verify_queue.put((symbol, price_change, time.time()))
 
             except asyncio.CancelledError:
