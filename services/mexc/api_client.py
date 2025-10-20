@@ -463,31 +463,43 @@ class MexcClient:
             return None
 
     async def get_full_ticker(self, symbol: str) -> Optional[Dict[str, float]]:
-        """Получить полные 24h данные по монете"""
+        """Получить полные 24h данные по монете (фьючерсы)"""
         try:
-            # ✅ '_'-lary aýyr, soňra UPPER
-            clean_symbol = symbol.replace('_', '').upper()
-            url = f"{self.base_url}/api/v3/ticker/24hr?symbol={clean_symbol}"
+            # Используем CONTRACT ticker endpoint
+            url = f"{self.base_url}/api/v1/contract/ticker"
+            params = {"symbol": symbol}
 
-            async with self.session.get(url, timeout=self.timeout) as resp:
-                if resp.status != 200:
-                    print(f"⚠️ get_full_ticker({symbol}) status={resp.status}")
+            data = await self._make_request(url, params=params)
+
+            if not data or not data.get("success"):
+                logger.warning(f"get_full_ticker({symbol}): API вернул ошибку")
+                return None
+
+            ticker_data = data.get("data")
+
+            if not ticker_data:
+                return None
+
+            # Если список, берём первый элемент
+            if isinstance(ticker_data, list):
+                if len(ticker_data) == 0:
                     return None
+                ticker_data = ticker_data[0]
 
-                data = await resp.json()
-                return {
-                    "symbol": data.get("symbol"),
-                    "lastPrice": float(data.get("lastPrice", 0)),
-                    "openPrice": float(data.get("openPrice", 0)),
-                    "highPrice": float(data.get("highPrice", 0)),
-                    "lowPrice": float(data.get("lowPrice", 0)),
-                    "priceChange": float(data.get("priceChange", 0)),
-                    "priceChangePercent": float(data.get("priceChangePercent", 0)),
-                    "volume": float(data.get("volume", 0)),
-                    "quoteVolume": float(data.get("quoteVolume", 0))
-                }
+            # Парсим данные фьючерсов
+            return {
+                "symbol": ticker_data.get("symbol", symbol),
+                "lastPrice": float(ticker_data.get("lastPrice", 0)),
+                "openPrice": float(ticker_data.get("openPrice", 0)),
+                "highPrice": float(ticker_data.get("high24Price", 0)),
+                "lowPrice": float(ticker_data.get("low24Price", 0)),
+                "priceChange": float(ticker_data.get("riseFallValue", 0)),
+                "priceChangePercent": float(ticker_data.get("riseFallRate", 0)),
+                "volume": float(ticker_data.get("volume24", 0)),
+                "quoteVolume": float(ticker_data.get("amount24", 0))
+            }
         except Exception as e:
-            print(f"Ошибка get_full_ticker({symbol}): {e}")
+            logger.error(f"Ошибка get_full_ticker({symbol}): {e}")
             return None
 
     def get_metrics(self) -> Dict:

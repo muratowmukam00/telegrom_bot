@@ -183,6 +183,12 @@ class HybridMonitor:
             return
 
         now = time.time()
+
+        # ✅ КРИТИЧНО: Проверяем cooldown СРАЗУ (экономим CPU)
+        last_signal = self.last_signal_time.get(symbol, 0)
+        if now - last_signal < self.cooldown:
+            return
+
         cutoff_time = now - 900  # 15 минут
 
         old_price = None
@@ -203,13 +209,9 @@ class HybridMonitor:
         if price_change >= PRICE_CHANGE_THRESHOLD:
             self.price_alerts += 1
             logger.info(f"[PRICE ALERT] {symbol}: {price_change:.2f}% за 15 мин (enqueue)")
-            # быстрое пропускное решение: проверка cooldown перед enqueue не обязательна,
-            # но можно проверить, чтобы не захламлять очередь
-            last_signal = self.last_signal_time.get(symbol, 0)
-            if time.time() - last_signal < self.cooldown:
-                logger.debug(f"Cooldown active for {symbol}, skipping enqueue")
-                return
-            await self.verify_queue.put((symbol, price_change, time.time()))
+            # Обновляем last_signal_time СРАЗУ при enqueue (не ждём RSI проверки)
+            self.last_signal_time[symbol] = now
+            await self.verify_queue.put((symbol, price_change, now))
 
     # -----------------------
     # Worker & verification
@@ -534,10 +536,9 @@ class HybridMonitor:
                 f"📊 Сейчас мониторим <b>{len(symbols)}</b> пар\n"
                 f"🔍 Используемые фильтры:\n"
                 f"  • Изменение цены: ±<b>{PRICE_CHANGE_THRESHOLD}%</b> за 15 минут\n"
-                f"  • RSI 1h: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> (основной)\n"
-                f"  • RSI 15m: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> (подтверждение)\n"
-                f"  • Cooldown: <b>{self.cooldown} сек</b>\n\n"
-                f"🌐 Источник данных: WebSocket + REST API (workers={self.worker_count})\n\n"
+                f"  • RSI 1h: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> \n"
+                f"  • RSI 15m: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> \n\n"
+                f"🌐 Источник данных: https://contract.mexc.com \n\n"
                 f"🟢 Бот готов! Когда появится новый сигнал, вы получите уведомление 🚀\n\n"
                 f"💰 Удачной торговли и прибыльных сделок!"
             )
