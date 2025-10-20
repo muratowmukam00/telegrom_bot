@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-run_hybrid_optimized.py
-Оптимизированная версия run_hybrid.py
-- очередь проверки RSI (asyncio.Queue)
-- worker pool (по умолчанию 5)
-- per-minute full rescan (failsafe)
-- ограничение параллелизма через asyncio.Semaphore
-- простое кэширование klines (TTL)
-- логирование duration RSI checks
-- "умная" логика: сначала RSI 1h, 15m только если 1h экстремальный
+run_hybrid_optimized.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+Фиксы:
+1. Cooldown проверяется ДО enqueue (не после RSI)
+2. Добавлен tracking последней проверки (last_check_time)
+3. Per-minute rescan учитывает последнюю проверку
+4. Убрана дублирующая очередь задач
 """
 
 import asyncio
@@ -35,7 +32,6 @@ from services.mexc.api_client import MexcClient
 from services.mexc.ws_client import MexcWSClient
 
 
-# === Настройка логирования ===
 def setup_logging():
     """Настроить production logging"""
     log_dir = Path("logs")
@@ -66,7 +62,6 @@ def setup_logging():
 logger = setup_logging()
 
 
-# === Фильтр WS шума (по желанию) ===
 class WSNoiseFilter(logging.Filter):
     """Убирает лишние WS сообщения из логов"""
     def filter(self, record):
@@ -83,36 +78,33 @@ for name in logging.root.manager.loggerDict:
     try:
         logging.getLogger(name).addFilter(WSNoiseFilter())
     except Exception:
-        # некоторые логгеры могут быть не настроены для фильтрации
         pass
 
 
-# === Константы ===
 SYMBOLS_FILE = Path("data/symbols_usdt.txt")
-STATS_INTERVAL = 300  # Статистика каждые 5 минут
-KLINES_CACHE_TTL = 20  # seconds cache for klines to reduce REST calls
-DEFAULT_WORKER_COUNT = 5  # agreed value
+STATS_INTERVAL = 300
+KLINES_CACHE_TTL = 20
+DEFAULT_WORKER_COUNT = 5
+CHECK_COOLDOWN = 60  # ⚡ НОВОЕ: минимальное время между проверками одной монеты
 
 
 class HybridMonitor:
-    """
-    Оптимизированный гибридный монитор
-    """
+    """Оптимизированный гибридный монитор с правильным cooldown"""
 
     def __init__(self, bot_token: str, chat_id: str, worker_count: int = DEFAULT_WORKER_COUNT):
         self.telegram = TelegramService(bot_token)
         self.chat_id = chat_id
 
-        # Буферы цен и времён
         self.prices: Dict[str, List[float]] = defaultdict(list)
         self.timestamps: Dict[str, List[float]] = defaultdict(list)
         self.max_buffer = 1200
 
-        # Контроль сигналов
-        self.last_signal_time: Dict[str, float] = {}
-        self.cooldown = 300  # 5 минут
+        # ⚡ ИСПРАВЛЕНО: Раздельный tracking для проверок и сигналов
+        self.last_check_time: Dict[str, float] = {}  # Когда последний раз проверяли RSI
+        self.last_signal_time: Dict[str, float] = {}  # Когда последний раз отправляли сигнал
+        self.check_cooldown = CHECK_COOLDOWN  # 1 минута между проверками
+        self.signal_cooldown = 300  # 5 минут между сигналами
 
-        # Статистика
         self.ticks_received = 0
         self.signals_found = 0
         self.price_alerts = 0
@@ -120,33 +112,22 @@ class HybridMonitor:
         self.start_time = time.time()
         self.last_stats_time = time.time()
 
-        # Флаг остановки
         self.is_running = False
         self.shutdown_event = asyncio.Event()
-
-        # WebSocket клиент
         self.ws_client: Optional[MexcWSClient] = None
 
-        # Очередь и воркеры для верификации RSI
         self.verify_queue: asyncio.Queue = asyncio.Queue()
         self.worker_count = worker_count
         self.verify_workers: List[asyncio.Task] = []
         self.verify_sem = asyncio.Semaphore(self.worker_count)
 
-        # Кеш klines: key -> (timestamp, data)
         self._klines_cache: Dict[Tuple[str, str], Tuple[float, List[dict]]] = {}
-
-        # Профилинг времени RSI
         self._rsi_durations: List[float] = []
 
-    # -----------------------
-    # WS message handler
-    # -----------------------
     async def handle_ws_message(self, data: dict):
-        """Обработка WebSocket сообщений — lightweight: сохраняем цену и помещаем задачу в очередь при триггере"""
+        """Обработка WebSocket сообщений"""
         try:
             symbol = data.get("s", "").upper()
-            # поддержка разных форматов: price может быть 'c' или 'price'
             price_raw = data.get("c", data.get("price", None))
             if price_raw is None:
                 return
@@ -160,7 +141,6 @@ class HybridMonitor:
 
             now = time.time()
 
-            # Обновляем буферы
             self.prices[symbol].append(price)
             self.timestamps[symbol].append(now)
 
@@ -170,7 +150,6 @@ class HybridMonitor:
 
             self.ticks_received += 1
 
-            # Быстрая проверка изменения цены — только enqueue
             await self._maybe_enqueue_price_alert(symbol)
 
         except Exception as e:
@@ -178,18 +157,18 @@ class HybridMonitor:
             logger.error(f"Ошибка обработки WS: {e}", exc_info=True)
 
     async def _maybe_enqueue_price_alert(self, symbol: str):
-        """Лёгкая проверка движения за 15 минут — если превышает порог, кладём в очередь"""
+        """Проверка движения цены с cooldown на ПРОВЕРКУ (не на сигнал)"""
         if len(self.prices[symbol]) < 2:
             return
 
         now = time.time()
 
-        # ✅ КРИТИЧНО: Проверяем cooldown СРАЗУ (экономим CPU)
-        last_signal = self.last_signal_time.get(symbol, 0)
-        if now - last_signal < self.cooldown:
-            return
+        # ⚡ ИСПРАВЛЕНО: Проверяем cooldown на ПРОВЕРКУ (не на сигнал)
+        last_check = self.last_check_time.get(symbol, 0)
+        if now - last_check < self.check_cooldown:
+            return  # Эту монету проверяли недавно
 
-        cutoff_time = now - 900  # 15 минут
+        cutoff_time = now - 900
 
         old_price = None
         ts = self.timestamps[symbol]
@@ -208,34 +187,31 @@ class HybridMonitor:
 
         if price_change >= PRICE_CHANGE_THRESHOLD:
             self.price_alerts += 1
+            # ⚡ ИСПРАВЛЕНО: Обновляем last_check_time СРАЗУ при enqueue
+            self.last_check_time[symbol] = now
             logger.info(f"[PRICE ALERT] {symbol}: {price_change:.2f}% за 15 мин (enqueue)")
-            # Обновляем last_signal_time СРАЗУ при enqueue (не ждём RSI проверки)
-            # self.last_signal_time[symbol] = now
             await self.verify_queue.put((symbol, price_change, now))
 
-    # -----------------------
-    # Worker & verification
-    # -----------------------
     async def _verify_worker(self, worker_id: int):
+        """Worker для проверки RSI"""
         logger.info(f"RSI worker #{worker_id} запущен")
         while self.is_running:
             try:
                 item = await self.verify_queue.get()
                 if item is None:
-                    # sentinel для завершения
                     self.verify_queue.task_done()
                     break
 
                 symbol, price_change, enqueued_at = item
 
+                # ⚡ ИСПРАВЛЕНО: Проверяем signal cooldown (не check cooldown)
                 now = time.time()
                 last_signal = self.last_signal_time.get(symbol, 0)
-                if now - last_signal < self.cooldown:
-                    logger.debug(f"Worker #{worker_id}: Cooldown for {symbol}, skipping")
+                if now - last_signal < self.signal_cooldown:
+                    logger.debug(f"Worker #{worker_id}: Signal cooldown for {symbol}, skipping")
                     self.verify_queue.task_done()
                     continue
 
-                # Ограничение параллелизма REST-ов
                 async with self.verify_sem:
                     t0 = time.time()
                     try:
@@ -256,23 +232,17 @@ class HybridMonitor:
         logger.info(f"RSI worker #{worker_id} завершён")
 
     async def verify_with_rsi(self, symbol: str, price_change: float):
-        """
-        Проверка RSI.
-        Оптимизация: сначала запрашиваем 1h, если он экстремальный (за пределами), только тогда запрашиваем 15m.
-        Используем кэширование klines чтобы снизить количество REST-запросов.
-        """
+        """Проверка RSI (сначала 1h, потом 15m только если 1h экстремальный)"""
         try:
             t_start = time.time()
             logger.info(f"[RSI CHECK] {symbol}")
 
-            # Проверка cooldown ещё раз (безопасность)
             now = time.time()
             last_signal = self.last_signal_time.get(symbol, 0)
-            if now - last_signal < self.cooldown:
-                logger.debug(f"verify_with_rsi: cooldown active for {symbol}")
+            if now - last_signal < self.signal_cooldown:
+                logger.debug(f"verify_with_rsi: signal cooldown active for {symbol}")
                 return
 
-            # Получаем 1h klines (из кеша при возможности)
             klines_1h = await self._get_klines_cached(symbol, "1h", 100)
             if not klines_1h:
                 logger.warning(f"Нет 1h данных для {symbol}")
@@ -288,12 +258,10 @@ class HybridMonitor:
 
             logger.info(f"  RSI 1h: {rsi_1h:.1f} ({'✓' if rsi_1h_passed else '✗'})")
 
-            # Если 1h не экстремальный — не выполняем 15m (экономим запросы)
             if not rsi_1h_passed:
                 logger.debug(f"{symbol}: RSI 1h нейтральный ({rsi_1h:.1f}), пропускаем RSI 15m")
                 return
 
-            # Только если 1h экстремальный — запрашиваем 15m
             klines_15m = await self._get_klines_cached(symbol, "15m", 100)
             if not klines_15m:
                 logger.warning(f"Нет 15m данных для {symbol}")
@@ -309,7 +277,6 @@ class HybridMonitor:
 
             logger.info(f"  RSI 15m: {rsi_15m:.1f} ({'✓' if rsi_15m_passed else '✗'})")
 
-            # Если оба подтверждают — отправляем сигнал
             if rsi_1h_passed and rsi_15m_passed:
                 await self.send_signal(symbol, price_change, rsi_1h, rsi_15m)
             else:
@@ -321,11 +288,8 @@ class HybridMonitor:
             self.errors_count += 1
             logger.error(f"Ошибка RSI для {symbol}: {e}", exc_info=True)
 
-    # -----------------------
-    # Klines cache helper
-    # -----------------------
     async def _get_klines_cached(self, symbol: str, interval: str, limit: int):
-        """Возвращает klines либо из cache, либо делает REST-запрос"""
+        """Возвращает klines из cache или делает REST-запрос"""
         key = (symbol, interval)
         now = time.time()
         cached = self._klines_cache.get(key)
@@ -334,7 +298,6 @@ class HybridMonitor:
             if now - ts < KLINES_CACHE_TTL:
                 return data
 
-        # Если нет cache или просрочен — запросим
         try:
             async with MexcClient(timeout=30) as client:
                 data = await client.get_klines(symbol, interval, limit)
@@ -345,23 +308,14 @@ class HybridMonitor:
             logger.error(f"Error fetching klines {symbol} {interval}: {e}")
             return None
 
-    # -----------------------
-    # Send signal (telegram + chart)
-    # -----------------------
-    async def send_signal(
-            self,
-            symbol: str,
-            price_change: float,
-            rsi_1h: float,
-            rsi_15m: float
-    ):
-        """Отправка сигнала в Telegram (в одном сообщении с графиком и подробным caption)"""
+    async def send_signal(self, symbol: str, price_change: float, rsi_1h: float, rsi_15m: float):
+        """Отправка сигнала в Telegram"""
         try:
             self.signals_found += 1
+            # ⚡ ИСПРАВЛЕНО: Обновляем SIGNAL cooldown
             self.last_signal_time[symbol] = time.time()
             logger.warning(f"🚨 SIGNAL FOUND: {symbol}!")
 
-            # Получаем данные для графика (5m)
             candles_5m = await self._get_klines_cached(symbol, "5m", 144)
             if not candles_5m:
                 try:
@@ -370,13 +324,12 @@ class HybridMonitor:
                 except Exception as e:
                     logger.error(f"Не удалось получить 5m для графика {symbol}: {e}")
 
-            # === Дополнительные данные (24h volume, change) ===
             try:
                 async with MexcClient(timeout=30) as client:
                     ticker_data = await client.get_full_ticker(symbol)
 
                 if ticker_data:
-                    volume_24h = ticker_data["quoteVolume"] / 1_000_000  # млн USDT
+                    volume_24h = ticker_data["quoteVolume"] / 1_000_000
                     change_24h = ticker_data["priceChangePercent"]
                     last_price = ticker_data["lastPrice"]
                     open_price = ticker_data["openPrice"]
@@ -388,7 +341,6 @@ class HybridMonitor:
                 logger.error(f"Ошибка получения full ticker для {symbol}: {e}")
                 volume_24h = change_24h = last_price = open_price = high_price = low_price = 0
 
-            # === Генерация графика ===
             if candles_5m and len(candles_5m) > 0:
                 Path("charts").mkdir(exist_ok=True)
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -401,7 +353,6 @@ class HybridMonitor:
                 )
 
                 if chart_path and Path(chart_path).exists():
-                    # === Формируем Telegram caption ===
                     price_change_for_caption = price_change if last_price >= open_price else -price_change
                     color_emoji = "🟩" if price_change_for_caption > 0 else "🟥"
                     caption = (
@@ -421,18 +372,14 @@ class HybridMonitor:
                         caption=caption,
                         parse_mode="HTML"
                     )
-                    logger.info(f"✅ Сигнал (в одном сообщении) отправлен для {symbol}")
+                    logger.info(f"✅ Сигнал отправлен для {symbol}")
 
         except Exception as e:
             self.errors_count += 1
             logger.error(f"Ошибка отправки сигнала {symbol}: {e}", exc_info=True)
 
-
-    # -----------------------
-    # Per-minute full rescan (failsafe)
-    # -----------------------
     async def per_minute_rescan(self, symbols: List[str]):
-        """Каждую минуту проходим по всем символам и ставим в очередь те, у которых price_change >= threshold"""
+        """Каждую минуту rescan с учётом last_check_time"""
         logger.info("per_minute_rescan started")
         while self.is_running:
             try:
@@ -440,11 +387,17 @@ class HybridMonitor:
                 if not self.is_running:
                     break
                 now = time.time()
-                cutoff_time = now - 900  # 15 минут
+                cutoff_time = now - 900
 
                 for symbol in symbols:
+                    # ⚡ ИСПРАВЛЕНО: Проверяем check cooldown
+                    last_check = self.last_check_time.get(symbol, 0)
+                    if now - last_check < self.check_cooldown:
+                        continue
+
                     if len(self.prices[symbol]) < 2:
                         continue
+
                     ts = self.timestamps[symbol]
                     pr = self.prices[symbol]
                     old_price = None
@@ -455,15 +408,14 @@ class HybridMonitor:
                             break
                     if old_price is None or old_price <= 0:
                         continue
+
                     new_price = pr[-1]
                     price_change = abs((new_price - old_price) / old_price * 100)
                     if price_change >= PRICE_CHANGE_THRESHOLD:
-                        # дополнительная проверка cooldown перед enqueue
-                        last_signal = self.last_signal_time.get(symbol, 0)
-                        if time.time() - last_signal < self.cooldown:
-                            continue
+                        # ⚡ ИСПРАВЛЕНО: Обновляем last_check_time
+                        self.last_check_time[symbol] = now
                         await self.verify_queue.put((symbol, price_change, time.time()))
-                # конец for
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -471,9 +423,6 @@ class HybridMonitor:
 
         logger.info("per_minute_rescan stopped")
 
-    # -----------------------
-    # stats loop
-    # -----------------------
     async def stats_loop(self):
         """Периодическая статистика"""
         while self.is_running:
@@ -485,7 +434,6 @@ class HybridMonitor:
                 uptime = time.time() - self.start_time
                 rate = self.ticks_received / uptime if uptime > 0 else 0
 
-                # profiling RSI durations
                 avg_rsi = (sum(self._rsi_durations) / len(self._rsi_durations)) if self._rsi_durations else 0
                 p95_rsi = sorted(self._rsi_durations)[int(len(self._rsi_durations) * 0.95)] if self._rsi_durations else 0
 
@@ -506,15 +454,12 @@ class HybridMonitor:
             except Exception as e:
                 logger.error(f"Ошибка stats_loop: {e}", exc_info=True)
 
-    # -----------------------
-    # Start / Stop
-    # -----------------------
     async def start(self):
         """Запуск монитора"""
         self.is_running = True
 
         logger.info("=" * 70)
-        logger.info("🚀 MEXC SIGNAL BOT (Optimized Production Mode)")
+        logger.info("🚀 MEXC SIGNAL BOT (Fixed Cooldown Version)")
         logger.info("=" * 70)
 
         try:
@@ -538,6 +483,8 @@ class HybridMonitor:
                 f"  • Изменение цены: ±<b>{PRICE_CHANGE_THRESHOLD}%</b> за 15 минут\n"
                 f"  • RSI 1h: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> \n"
                 f"  • RSI 15m: &gt;<b>{RSI_OVERBOUGHT}</b> или &lt;<b>{RSI_OVERSOLD}</b> \n\n"
+                f"⏱ Cooldown между проверками: <b>{self.check_cooldown}s</b>\n"
+                f"⏱ Cooldown между сигналами: <b>{self.signal_cooldown}s</b>\n\n"
                 f"🌐 Источник данных: https://contract.mexc.com \n\n"
                 f"🟢 Бот готов! Когда появится новый сигнал, вы получите уведомление 🚀\n\n"
                 f"💰 Удачной торговли и прибыльных сделок!"
@@ -549,39 +496,31 @@ class HybridMonitor:
                 parse_mode="HTML"
             )
 
-            # Создаём WebSocket клиент
             self.ws_client = MexcWSClient(symbols, on_message=self.handle_ws_message)
 
-            # Запускаем воркеры проверки RSI
             for i in range(self.worker_count):
                 t = asyncio.create_task(self._verify_worker(i + 1), name=f"rsi_worker_{i+1}")
                 self.verify_workers.append(t)
 
-            # Запускаем основные задачи: WS, stats, per_minute_rescan
             tasks = [
                 asyncio.create_task(self.ws_client.connect_all(), name="websocket"),
                 asyncio.create_task(self.stats_loop(), name="stats"),
                 asyncio.create_task(self.per_minute_rescan(symbols), name="per_minute_rescan"),
             ]
 
-            # Ждём shutdown_event
             await self.shutdown_event.wait()
             logger.info("🛑 Получен сигнал остановки, завершаю задачи...")
 
-            # Останавливаем WebSocket
             if self.ws_client:
                 await self.ws_client.stop()
 
-            # Посылаем sentinel None для завершения воркеров
             for _ in self.verify_workers:
                 await self.verify_queue.put(None)
 
-            # Отменяем все задачи (stats, per_minute_rescan, websocket)
             for task in tasks:
                 if not task.done():
                     task.cancel()
 
-            # Отменяем/ожидаем воркеров
             for t in self.verify_workers:
                 if not t.done():
                     t.cancel()
@@ -631,9 +570,7 @@ class HybridMonitor:
 
         logger.info("✅ Бот остановлен")
 
-# -----------------------
-# main()
-# -----------------------
+
 async def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("❌ TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть установлены!")
