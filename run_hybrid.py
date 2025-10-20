@@ -210,7 +210,7 @@ class HybridMonitor:
             self.price_alerts += 1
             logger.info(f"[PRICE ALERT] {symbol}: {price_change:.2f}% за 15 мин (enqueue)")
             # Обновляем last_signal_time СРАЗУ при enqueue (не ждём RSI проверки)
-            self.last_signal_time[symbol] = now
+            # self.last_signal_time[symbol] = now
             await self.verify_queue.put((symbol, price_change, now))
 
     # -----------------------
